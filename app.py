@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import functools
+import importlib.util
 import json
 import os
 from dataclasses import dataclass
@@ -19,6 +20,14 @@ from typing import Iterable, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
+
+if importlib.util.find_spec("polars") is None:  # pragma: no cover - dependency guard
+    raise ModuleNotFoundError(
+        "The dashboard depends on the 'polars' package. Install it with "
+        "'pip install -r requirements.txt' or, inside Anaconda, run "
+        "'conda install -c conda-forge polars pyarrow'."
+    )
+
 import polars as pl
 import pydeck as pdk
 import streamlit as st

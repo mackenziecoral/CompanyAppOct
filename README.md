@@ -14,6 +14,11 @@ GeoPandas to work with larger datasets without crashing.
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
+   If you are using Anaconda/Spyder instead of a virtual environment,
+   install the required packages with:
+   ```bash
+   conda install -c conda-forge polars pyarrow streamlit geopandas plotly
+   ```
 2. Configure environment variables if you need to connect to the live
    Oracle database:
    - `ORACLE_USER`
