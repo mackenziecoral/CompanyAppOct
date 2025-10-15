@@ -17,8 +17,12 @@ GeoPandas to work with larger datasets without crashing.
    If you are using Anaconda/Spyder instead of a virtual environment,
    install the required packages with:
    ```bash
-   conda install -c conda-forge polars pyarrow streamlit geopandas plotly
+   conda install -c conda-forge polars pyarrow streamlit geopandas plotly pyreadr
    ```
+   When the legacy `processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds`
+   snapshot is present alongside the app, the dashboard will automatically
+   convert it to parquet on first launch. Ensure the optional `pyreadr`
+   dependency is installed if you plan to rely on this fallback.
 2. Configure environment variables if you need to connect to the live
    Oracle database:
    - `ORACLE_USER`
@@ -36,6 +40,12 @@ When a processed parquet file is present it is used as the primary data
 source. If that file is absent the application will connect to the
 Oracle database and stream the well master data. Spatial overlays are
 loaded lazily from the shapefile directories.
+
+If neither a parquet snapshot nor a live database is available, placing
+the original RDS export in the application directory provides a
+zero-configuration offline option. The Streamlit port reads the RDS file
+with `pyreadr`, writes a parquet copy for subsequent runs, and exposes
+the same well metadata used in the Shiny application.
 
 ### Production analytics
 

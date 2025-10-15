@@ -7,3 +7,4 @@ pandas>=2.1
 pyogrio>=0.7
 oracledb>=1.4
 plotly>=5.18
+pyreadr>=0.5

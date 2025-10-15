@@ -40,6 +40,11 @@ try:  # Optional dependency – only required when a live DB is available
 except Exception:  # pragma: no cover - optional dependency
     oracledb = None
 
+try:  # Optional dependency – enables loading the legacy RDS snapshot
+    import pyreadr  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    pyreadr = None
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,6 +57,12 @@ PROCESSED_PARQUET = Path(
     os.getenv(
         "APP_PROCESSED_PARQUET",
         BASE_PATH / "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.parquet",
+    )
+)
+PROCESSED_RDS = Path(
+    os.getenv(
+        "APP_PROCESSED_RDS",
+        BASE_PATH / "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds",
     )
 )
 WOODMACK_COVERAGE_EXCEL = Path(
@@ -175,7 +186,50 @@ def chunked(sequence: Sequence[str], size: int) -> Iterable[list[str]]:
 def load_wells_from_parquet() -> pl.DataFrame:
     if not PROCESSED_PARQUET.exists():
         return pl.DataFrame()
-    return pl.read_parquet(PROCESSED_PARQUET)
+    try:
+        return pl.read_parquet(PROCESSED_PARQUET)
+    except Exception as exc:  # pragma: no cover - corrupted file
+        st.error(f"Unable to load cached parquet file {PROCESSED_PARQUET.name}: {exc}")
+        return pl.DataFrame()
+
+
+@functools.cache
+def load_wells_from_rds() -> pl.DataFrame:
+    """Load the legacy RDS snapshot when available."""
+
+    if not PROCESSED_RDS.exists():
+        return pl.DataFrame()
+
+    if pyreadr is None:
+        st.warning(
+            "An RDS snapshot is available but the optional 'pyreadr' package is missing. "
+            "Install it with 'pip install pyreadr' or via conda-forge to enable the fallback.",
+            icon="⚠️",
+        )
+        return pl.DataFrame()
+
+    try:
+        result = pyreadr.read_r(str(PROCESSED_RDS))
+    except Exception as exc:  # pragma: no cover - file parsing errors
+        st.error(f"Failed to read RDS file {PROCESSED_RDS.name}: {exc}")
+        return pl.DataFrame()
+
+    if not result:
+        return pl.DataFrame()
+
+    frame = next(iter(result.values()))
+    if frame is None or frame.empty:
+        return pl.DataFrame()
+
+    wells = pl.from_pandas(frame)
+
+    if wells.height > 0:
+        try:
+            wells.write_parquet(PROCESSED_PARQUET)
+        except Exception:  # pragma: no cover - filesystem permissions
+            pass
+
+    return wells
 
 
 def connect_to_db() -> Optional["oracledb.Connection"]:
@@ -413,6 +467,11 @@ def load_base_well_data() -> pl.DataFrame:
     cached = load_wells_from_parquet()
     if not cached.is_empty():
         return ensure_standard_identifiers(cached)
+
+    rds_snapshot = load_wells_from_rds()
+    if not rds_snapshot.is_empty():
+        return ensure_standard_identifiers(rds_snapshot)
+
     db_data = load_wells_from_db()
     if db_data.is_empty():
         st.warning("No well data available from cache or database.")
