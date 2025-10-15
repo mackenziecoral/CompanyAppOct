@@ -32,6 +32,26 @@ source. If that file is absent the application will connect to the
 Oracle database and stream the well master data. Spatial overlays are
 loaded lazily from the shapefile directories.
 
+### Production analytics
+
+The Streamlit port now mirrors the analytical workflows offered in the
+Shiny implementation:
+
+- **Single well analysis** – inspect converted monthly volumes, daily
+  rates, and cumulative totals for a selected well and download the
+  results.
+- **Filtered group cumulative** – aggregate production for the set of
+  wells currently visible on the map, respecting the product filters and
+  custom date window.
+- **Type curve analysis** – align wells by months on production to build
+  average and percentile curves using BOE rates.
+- **Operator group cumulative** – compare operator-level production over
+  a chosen period independent of the spatial filters.
+
+All production queries stream monthly PDEN data from Oracle in batches
+and cache the result to `.parquet` files inside the `cache/` directory
+to avoid repeat round-trips during a session.
+
 ### Why Polars?
 
 Polars executes most transformations in native Rust and automatically
