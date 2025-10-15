@@ -28,7 +28,28 @@ GeoPandas to work with larger datasets without crashing.
    - `ORACLE_USER`
    - `ORACLE_PASSWORD`
    - `ORACLE_DSN`
-   You can also override the default file locations with the variables
+
+   The Streamlit app also understands optional Oracle client settings:
+   - `ORACLE_TNS_ADMIN` or `TNS_ADMIN` – folder containing `tnsnames.ora`
+   - `ORACLE_CONFIG_DIR` – alternate name for the same directory
+   - `ORACLE_WALLET_DIR` – wallet location when database access requires it
+   - `ORACLE_CLIENT_LIB_DIR` – Instant Client directory if thick mode is needed
+
+   A sample `tnsnames.ora` matching the legacy Shiny setup ships with the
+   repository. Point `ORACLE_TNS_ADMIN` at the repository root or copy the
+   file into your corporate Oracle client directory. Set `ORACLE_DSN` to the
+   alias defined inside `tnsnames.ora` (for example `GDC_LINK`).
+
+   Credentials and paths can also be supplied via `~/.streamlit/secrets.toml`:
+   ```toml
+   [oracle]
+   user = "WOODMAC"
+   password = "c0pp3r"
+   dsn = "GDC_LINK"
+   tns_admin = "C:/oracle/network/admin"
+   ```
+
+   You can override the default file locations with the variables
    `APP_BASE_PATH`, `APP_PROCESSED_PARQUET`, `APP_WOODMACK_COVERAGE_XLSX`,
    `APP_SUBPLAY_SHAPEFILES` and `APP_COMPANY_SHAPEFILES`.
 3. Launch the app:

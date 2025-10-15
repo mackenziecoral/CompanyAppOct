@@ -13,6 +13,7 @@ import datetime as dt
 import functools
 import importlib.util
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,8 @@ DEFAULT_CONNECTION = {
     "mode": oracledb.AUTH_MODE_DEFAULT if oracledb else None,
 }
 
+logger = logging.getLogger(__name__)
+
 # Conversion factors
 E3M3_TO_MCF = 35.3147
 M3_TO_BBL = 6.28981
@@ -109,6 +112,106 @@ PRODUCT_TYPE_CHOICES = ["OIL", "CND", "GAS", "BOE"]
 # ---------------------------------------------------------------------------
 # Dataclasses and helpers
 # ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _oracle_runtime_options() -> dict[str, Optional[str]]:
+    """Collect optional Oracle client configuration hints."""
+
+    config_dir = (
+        os.getenv("ORACLE_TNS_ADMIN")
+        or os.getenv("ORACLE_CONFIG_DIR")
+        or os.getenv("TNS_ADMIN")
+    )
+    wallet_dir = os.getenv("ORACLE_WALLET_DIR")
+    lib_dir = os.getenv("ORACLE_CLIENT_LIB_DIR")
+
+    secrets_config: dict[str, str] = {}
+    with contextlib.suppress(Exception):
+        secrets_section = st.secrets.get("oracle", {})  # type: ignore[arg-type]
+        if isinstance(secrets_section, dict):
+            secrets_config = {str(k).lower(): str(v) for k, v in secrets_section.items() if v}
+
+    if "tns_admin" in secrets_config:
+        config_dir = secrets_config["tns_admin"]
+    if "config_dir" in secrets_config:
+        config_dir = secrets_config["config_dir"]
+    if "wallet_dir" in secrets_config:
+        wallet_dir = secrets_config["wallet_dir"]
+    if "lib_dir" in secrets_config:
+        lib_dir = secrets_config["lib_dir"]
+
+    if not config_dir:
+        bundled_tns = BASE_PATH / "tnsnames.ora"
+        if bundled_tns.exists():
+            config_dir = str(bundled_tns.parent)
+
+    return {
+        "config_dir": config_dir,
+        "wallet_dir": wallet_dir,
+        "lib_dir": lib_dir,
+    }
+
+
+@functools.cache
+def _oracle_connection_details() -> dict[str, Optional[str]]:
+    """Resolve connection credentials from defaults, env vars, or Streamlit secrets."""
+
+    details = dict(DEFAULT_CONNECTION)
+
+    env_overrides = {
+        "user": os.getenv("ORACLE_USER"),
+        "password": os.getenv("ORACLE_PASSWORD"),
+        "dsn": os.getenv("ORACLE_DSN"),
+    }
+    details.update({k: v for k, v in env_overrides.items() if v})
+
+    with contextlib.suppress(Exception):
+        secrets_section = st.secrets.get("oracle", {})  # type: ignore[arg-type]
+        if isinstance(secrets_section, dict):
+            for key in ("user", "password", "dsn"):
+                if key in secrets_section and secrets_section[key]:
+                    details[key] = str(secrets_section[key])
+            mode_value = secrets_section.get("mode") if "mode" in secrets_section else None
+            if mode_value and oracledb is not None:
+                mode_token = str(mode_value).upper()
+                if not mode_token.startswith("AUTH_MODE_"):
+                    mode_token = f"AUTH_MODE_{mode_token}"
+                details["mode"] = getattr(oracledb, mode_token, details.get("mode"))
+
+    return details
+
+
+def _configure_oracle_client() -> None:
+    """Apply optional Oracle client configuration before establishing a connection."""
+
+    if oracledb is None:
+        return
+
+    options = _oracle_runtime_options()
+    config_dir = options.get("config_dir")
+    wallet_dir = options.get("wallet_dir")
+    lib_dir = options.get("lib_dir")
+
+    if config_dir:
+        os.environ.setdefault("TNS_ADMIN", config_dir)
+        try:
+            oracledb.defaults.config_dir = config_dir  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - attribute may not exist in thin mode
+            logger.debug("Unable to set Oracle config_dir: %s", exc)
+
+    if wallet_dir:
+        os.environ.setdefault("WALLET_LOCATION", wallet_dir)
+        try:
+            oracledb.defaults.wallet_location = wallet_dir  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - optional attribute
+            logger.debug("Unable to set wallet location: %s", exc)
+
+    if lib_dir:
+        try:
+            oracledb.init_oracle_client(lib_dir=lib_dir, config_dir=config_dir)
+        except Exception as exc:  # pragma: no cover - thick client configuration
+            logger.warning("Oracle client initialisation failed: %s", exc)
 @dataclass
 class SpatialLayer:
     """Container describing a vector layer loaded from disk."""
@@ -234,17 +337,42 @@ def load_wells_from_rds() -> pl.DataFrame:
 
 def connect_to_db() -> Optional["oracledb.Connection"]:
     if oracledb is None:
+        st.info(
+            "python-oracledb is not installed. Install it to enable live Oracle queries."
+        )
         return None
 
+    details = _oracle_connection_details()
+    missing = [key for key in ("user", "password", "dsn") if not details.get(key)]
+    if missing:
+        st.warning(
+            "Missing Oracle connection details: "
+            + ", ".join(missing)
+            + ". Configure them via environment variables or Streamlit secrets."
+        )
+        return None
+
+    _configure_oracle_client()
+
     try:
+        mode = details.get("mode") if details.get("mode") is not None else oracledb.AUTH_MODE_DEFAULT
         return oracledb.connect(
-            user=DEFAULT_CONNECTION["user"],
-            password=DEFAULT_CONNECTION["password"],
-            dsn=DEFAULT_CONNECTION["dsn"],
-            mode=DEFAULT_CONNECTION["mode"],
+            user=details["user"],
+            password=details["password"],
+            dsn=details["dsn"],
+            mode=mode,
         )
     except Exception as exc:  # pragma: no cover - network / credentials
-        st.error(f"Unable to connect to Oracle: {exc}")
+        st.error(
+            "Unable to connect to Oracle: "
+            + str(exc)
+            + "\nVerify the DSN entry in tnsnames.ora and ensure credentials are correct."
+        )
+        if "ORA-12154" in str(exc):
+            st.info(
+                "ORA-12154 indicates the TNS alias could not be resolved. "
+                "Ensure TNS_ADMIN points to the folder containing tnsnames.ora."
+            )
         return None
 
 
@@ -463,19 +591,20 @@ def filter_wells(wells: pl.DataFrame) -> pl.DataFrame:
     return filtered
 
 
-def load_base_well_data() -> pl.DataFrame:
+def load_base_well_data() -> tuple[pl.DataFrame, str]:
     cached = load_wells_from_parquet()
     if not cached.is_empty():
-        return ensure_standard_identifiers(cached)
+        return ensure_standard_identifiers(cached), "parquet cache"
 
     rds_snapshot = load_wells_from_rds()
     if not rds_snapshot.is_empty():
-        return ensure_standard_identifiers(rds_snapshot)
+        return ensure_standard_identifiers(rds_snapshot), "legacy RDS snapshot"
 
     db_data = load_wells_from_db()
     if db_data.is_empty():
         st.warning("No well data available from cache or database.")
-    return ensure_standard_identifiers(db_data)
+        return ensure_standard_identifiers(db_data), "unavailable"
+    return ensure_standard_identifiers(db_data), "oracle"
 
 
 @st.cache_data(show_spinner="Fetching monthly production...")
@@ -936,7 +1065,19 @@ def main() -> None:
         """
     )
 
-    wells = merge_well_metadata(load_base_well_data())
+    base_wells, wells_source = load_base_well_data()
+    wells = merge_well_metadata(base_wells)
+    if wells_source == "oracle":
+        dsn = _oracle_connection_details().get("dsn") or "<unknown>"
+        st.success(f"Well metadata loaded from Oracle using DSN '{dsn}'.")
+    elif wells_source == "parquet cache":
+        st.info("Well metadata loaded from the local parquet cache.")
+    elif wells_source == "legacy RDS snapshot":
+        st.info("Well metadata converted from the legacy RDS snapshot.")
+    else:
+        st.warning(
+            "Well metadata could not be loaded. Configure Oracle access or provide a cache."
+        )
     if wells.is_empty():
         st.stop()
 
