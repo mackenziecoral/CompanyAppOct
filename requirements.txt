@@ -1,0 +1,8 @@
+streamlit>=1.32
+polars>=0.20
+geopandas>=0.14
+pydeck>=0.8
+shapely>=2.0
+pandas>=2.1
+pyogrio>=0.7
+oracledb>=1.4
