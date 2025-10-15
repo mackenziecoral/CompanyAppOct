@@ -1,0 +1,11 @@
+GDC_LINK.geologic.com =
+	(DESCRIPTION =
+		(ADDRESS_LIST =
+		(SOURCE_ROUTE = OFF)
+		(FAILOVER = ON)
+		(ADDRESS = (PROTOCOL = TCP)(HOST = gdcdata1.geologic.com)(PORT = 1521))
+		(ADDRESS = (PROTOCOL = TCP)(HOST = gdcdata2.geologic.com)(PORT = 1521)) )
+		(CONNECT_DATA =
+			(SERVICE_NAME = GEOPROD.geologic.com) )
+)
+
