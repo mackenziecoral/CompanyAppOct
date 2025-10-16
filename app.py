@@ -11,11 +11,13 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import functools
+import importlib
 import importlib.util
 import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -37,15 +39,33 @@ from shapely.geometry import Point
 
 import plotly.graph_objects as go
 
-try:  # Optional dependency – only required when a live DB is available
-    import oracledb  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    oracledb = None
 
-try:  # Optional dependency – enables loading the legacy RDS snapshot
-    import pyreadr  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    pyreadr = None
+def _load_optional_module(module_name: str) -> tuple[Optional[object], Optional[str], Optional[str]]:
+    """Best-effort loader that returns module, error, and location."""
+
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.loader is None:  # pragma: no cover - environment dependent
+        return None, f"Module '{module_name}' is not installed on this interpreter.", None
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - import errors are environment specific
+        sys.modules.pop(module_name, None)
+        location = getattr(spec, "origin", None)
+        return (
+            None,
+            f"Module '{module_name}' is installed at {location or 'an unknown location'} but failed to import: {exc}",
+            location,
+        )
+
+    origin = getattr(module, "__file__", getattr(spec, "origin", None))
+    return module, None, origin
+
+
+oracledb, ORACLE_IMPORT_ERROR, ORACLE_MODULE_PATH = _load_optional_module("oracledb")
+pyreadr, PYREADR_IMPORT_ERROR, PYREADR_MODULE_PATH = _load_optional_module("pyreadr")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +225,9 @@ def _diagnose_oracle_environment(
             DataSourceStatus(
                 "python-oracledb",
                 False,
-                "The python-oracledb package is not installed. Install it with 'pip install oracledb' or via conda-forge.",
+                ORACLE_IMPORT_ERROR
+                or "python-oracledb could not be imported. Verify the interpreter has access to the package.",
+                ORACLE_MODULE_PATH,
             )
         )
         return diagnostics
@@ -215,6 +237,7 @@ def _diagnose_oracle_environment(
             "python-oracledb",
             True,
             f"python-oracledb {getattr(oracledb, '__version__', 'unknown version')} is available.",
+            ORACLE_MODULE_PATH or getattr(oracledb, "__file__", None),
         )
     )
 
@@ -474,7 +497,8 @@ def load_wells_from_rds() -> pl.DataFrame:
 def connect_to_db() -> Optional["oracledb.Connection"]:
     if oracledb is None:
         st.info(
-            "python-oracledb is not installed. Install it to enable live Oracle queries."
+            ORACLE_IMPORT_ERROR
+            or "python-oracledb could not be imported. Install or repair the package to enable live Oracle queries."
         )
         return None
 
@@ -768,7 +792,8 @@ def load_base_well_data() -> tuple[pl.DataFrame, str, list[DataSourceStatus]]:
                 DataSourceStatus(
                     "Legacy RDS snapshot",
                     False,
-                    "RDS snapshot located but the optional 'pyreadr' dependency is not installed.",
+                    PYREADR_IMPORT_ERROR
+                    or "RDS snapshot located but the optional 'pyreadr' dependency is unavailable.",
                     str(PROCESSED_RDS),
                 )
             )
