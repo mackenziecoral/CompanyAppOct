@@ -19,10 +19,14 @@ GeoPandas to work with larger datasets without crashing.
    ```bash
    conda install -c conda-forge polars pyarrow streamlit geopandas plotly pyreadr
    ```
-   When the legacy `processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds`
-   snapshot is present alongside the app, the dashboard will automatically
-   convert it to parquet on first launch. Ensure the optional `pyreadr`
-   dependency is installed if you plan to rely on this fallback.
+   Windows and Anaconda users can skip the manual steps by invoking the helper
+   script from an Anaconda Prompt:
+   ```bat
+   run_build_and_app.bat YourCondaEnvName
+   ```
+   The batch file activates the requested environment, installs the Python
+   dependencies, triggers a one-time Oracle cache build, and finally launches
+   `streamlit run app.py`.
 2. Configure environment variables if you need to connect to the live
    Oracle database:
    - `ORACLE_USER`
@@ -65,17 +69,26 @@ GeoPandas to work with larger datasets without crashing.
    streamlit run app.py
    ```
 
-When a processed parquet file is present it is used as the primary data
-source. If that file is absent the application will connect to the
-Oracle database and stream the well master data. Spatial overlays are
-loaded lazily from the shapefile directories.
+The Streamlit port now prefers **Oracle → parquet cache → legacy RDS** when
+bootstrapping the well master data:
 
-If neither a parquet snapshot nor a live database is available, placing
-the original RDS export in the application directory provides a
-zero-configuration offline option. The Streamlit port automatically scans
-the working directory tree for the legacy RDS/parquet filenames, reads the
-RDS file with `pyreadr`, writes a parquet copy for subsequent runs, and
-exposes the same well metadata used in the Shiny application.
+1. If Oracle credentials are configured, the app connects with
+   `python-oracledb`, streams the latest well metadata, and uses it directly.
+   When the local parquet snapshot is missing the connection response is
+   immediately written to disk via `build_cache_from_oracle()` so future runs
+   can operate offline.
+2. When Oracle access is unavailable, the previously generated
+   `processed_app_data*.parquet` snapshot is loaded instead.
+3. If both options fail and the optional `pyreadr` dependency is installed,
+   the legacy RDS export is treated as a last-resort fallback.
+
+Spatial overlays are still loaded lazily from the shapefile directories.
+
+The top of the Streamlit page includes a compact runtime diagnostics panel
+that lists the interpreter path, whether `python-oracledb` was imported
+successfully, the status of the parquet cache, and the active DSN/mode. Use it
+to verify that Streamlit is using the same environment where Oracle
+dependencies were installed.
 
 ### Troubleshooting Oracle connectivity
 
@@ -91,7 +104,9 @@ exposes the same well metadata used in the Shiny application.
 - The app automatically falls back to a compatibility layer when only
   `cx_Oracle` is available. While this provides the legacy behaviour, the
   recommended setup uses `python-oracledb` because it supports both thin and
-  thick modes in a single package.
+  thick modes in a single package. `build_cache_from_oracle()` will honour the
+  thick client when `ORACLE_CLIENT_LIB_DIR` is set and defaults to the thin
+  easy-connect mode otherwise.
 - When you rely on a TNS alias, confirm that the alias exists in the reported
   `tnsnames.ora` file and that `ORACLE_TNS_ADMIN` (or `TNS_ADMIN`) points to
   the correct directory. The diagnostics expander will highlight missing or

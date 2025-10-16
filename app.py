@@ -21,7 +21,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 
 import geopandas as gpd
 import pandas as pd
@@ -169,6 +169,36 @@ class DataSourceStatus:
     details: str
     location: Optional[str] = None
 
+# SQL used to pull the core well metadata from Oracle.
+WELL_METADATA_QUERY = """
+    SELECT W.UWI,
+           W.GSL_UWI,
+           W.SURFACE_LATITUDE,
+           W.SURFACE_LONGITUDE,
+           W.BOTTOM_HOLE_LATITUDE,
+           W.BOTTOM_HOLE_LONGITUDE,
+           W.GSL_FULL_LATERAL_LENGTH,
+           W.ABANDONMENT_DATE,
+           W.WELL_NAME,
+           W.CURRENT_STATUS,
+           W.OPERATOR AS OPERATOR_CODE,
+           W.CONFIDENTIAL_TYPE,
+           P.STRAT_UNIT_ID,
+           W.SPUD_DATE,
+           PFS.FIRST_PROD_DATE,
+           W.FINAL_TD,
+           W.PROVINCE_STATE,
+           W.COUNTRY,
+           FL.FIELD_NAME
+    FROM WELL W
+    LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
+    LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
+    LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
+    WHERE W.SURFACE_LATITUDE IS NOT NULL
+      AND W.SURFACE_LONGITUDE IS NOT NULL
+      AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
+"""
+
 # Conversion factors
 E3M3_TO_MCF = 35.3147
 M3_TO_BBL = 6.28981
@@ -264,6 +294,25 @@ def _oracle_connection_details() -> dict[str, Optional[str]]:
                 details["mode"] = getattr(oracledb, mode_token, details.get("mode"))
 
     return details
+
+
+def _has_oracle_credentials(details: dict[str, Optional[str]]) -> bool:
+    """Return True when the minimum Oracle credentials are available."""
+
+    return all(details.get(key) for key in ("user", "password", "dsn"))
+
+
+def _determine_client_mode(
+    details: dict[str, Optional[str]], options: dict[str, Optional[str]]
+) -> str:
+    """Infer the Oracle client mode for diagnostics."""
+
+    if options.get("lib_dir"):
+        return "thick"
+
+    dsn = (details.get("dsn") or "").strip()
+    easy_connect = bool(re.match(r"[^:/]+:\d+/.+", dsn))
+    return "thin" if easy_connect else "tns"
 
 
 def _diagnose_oracle_environment(
@@ -557,107 +606,155 @@ def load_wells_from_rds() -> pl.DataFrame:
         return pl.DataFrame()
 
     wells = pl.from_pandas(frame)
-
-    if wells.height > 0:
-        try:
-            wells.write_parquet(PROCESSED_PARQUET)
-        except Exception:  # pragma: no cover - filesystem permissions
-            pass
-
     return wells
 
 
-def connect_to_db() -> Optional["oracledb.Connection"]:
+def _open_oracle_connection(
+    details: dict[str, Optional[str]], *, emit_messages: bool
+) -> Optional["oracledb.Connection"]:
+    """Return an Oracle connection or *None* when unavailable."""
+
     if oracledb is None:
-        st.info(
-            ORACLE_IMPORT_ERROR
-            or "python-oracledb could not be imported. Install or repair the package to enable live Oracle queries."
-        )
+        if emit_messages:
+            st.info(
+                ORACLE_IMPORT_ERROR
+                or "python-oracledb could not be imported. Install or repair the package to enable live Oracle queries.",
+            )
         return None
 
-    details = _oracle_connection_details()
-    missing = [key for key in ("user", "password", "dsn") if not details.get(key)]
-    if missing:
-        st.warning(
-            "Missing Oracle connection details: "
-            + ", ".join(missing)
-            + ". Configure them via environment variables or Streamlit secrets."
-        )
-        return None
-
-    _configure_oracle_client()
-
-    if USING_CX_ORACLE_SHIM:
+    if USING_CX_ORACLE_SHIM and emit_messages:
         st.info(
             "python-oracledb is unavailable in this environment; using the cx_Oracle compatibility layer instead.",
             icon="ℹ️",
         )
 
-    try:
-        mode = details.get("mode") if details.get("mode") is not None else oracledb.AUTH_MODE_DEFAULT
-        return oracledb.connect(
-            user=details["user"],
-            password=details["password"],
-            dsn=details["dsn"],
-            mode=mode,
-        )
-    except Exception as exc:  # pragma: no cover - network / credentials
-        st.error(
-            "Unable to connect to Oracle: "
-            + str(exc)
-            + "\nVerify the DSN entry in tnsnames.ora and ensure credentials are correct."
-        )
-        if "ORA-12154" in str(exc):
-            st.info(
-                "ORA-12154 indicates the TNS alias could not be resolved. "
-                "Ensure TNS_ADMIN points to the folder containing tnsnames.ora."
+    missing = [key for key in ("user", "password", "dsn") if not details.get(key)]
+    if missing:
+        if emit_messages:
+            st.warning(
+                "Missing Oracle connection details: "
+                + ", ".join(missing)
+                + ". Configure them via environment variables or Streamlit secrets.",
             )
         return None
+
+    _configure_oracle_client()
+
+    connect_kwargs = {
+        "user": details["user"],
+        "password": details["password"],
+        "dsn": details["dsn"],
+    }
+    if details.get("mode") is not None:
+        connect_kwargs["mode"] = details["mode"]
+
+    try:
+        return oracledb.connect(**connect_kwargs)
+    except Exception as exc:  # pragma: no cover - network / credentials
+        if emit_messages:
+            st.error(
+                "Unable to connect to Oracle: "
+                + str(exc)
+                + "\nVerify the DSN entry in tnsnames.ora and ensure credentials are correct.",
+            )
+            if "ORA-12154" in str(exc):
+                st.info(
+                    "ORA-12154 indicates the TNS alias could not be resolved. "
+                    "Ensure TNS_ADMIN points to the folder containing tnsnames.ora.",
+                )
+        return None
+
+
+def _fetch_wells_from_connection(connection: "oracledb.Connection") -> pl.DataFrame:
+    """Run the well metadata query using an open Oracle connection."""
+
+    with contextlib.closing(connection.cursor()) as cursor:
+        cursor.execute(WELL_METADATA_QUERY)
+        rows = cursor.fetchall()
+        description = cursor.description or []
+
+    if not rows or not description:
+        return pl.DataFrame()
+
+    columns = [col[0] for col in description]
+    wells = pl.DataFrame(rows, schema=columns)
+    return ensure_standard_identifiers(wells)
+
+
+def _write_parquet_cache(wells: pl.DataFrame) -> Tuple[bool, str]:
+    """Persist the supplied frame to the configured parquet cache."""
+
+    if wells.is_empty():
+        return False, "Oracle query returned no well records."
+
+    try:
+        PROCESSED_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+        wells.write_parquet(PROCESSED_PARQUET)
+    except Exception as exc:  # pragma: no cover - filesystem permissions
+        return False, f"Unable to write parquet cache: {exc}"
+
+    return True, f"Wrote {wells.height} rows to {PROCESSED_PARQUET.name}."
+
+
+@functools.lru_cache(maxsize=1)
+def _auto_build_parquet_cache() -> Tuple[bool, str]:
+    """Attempt to build the parquet cache once per process when missing."""
+
+    return _try_build_parquet_from_oracle()
+
+
+def _try_build_parquet_from_oracle(force: bool = False) -> Tuple[bool, str]:
+    """Create the parquet cache using live Oracle data when possible."""
+
+    if PROCESSED_PARQUET.exists() and not force:
+        return True, f"Parquet cache already present at {PROCESSED_PARQUET}."
+
+    details = _oracle_connection_details()
+    options = _oracle_runtime_options()
+
+    if oracledb is None:
+        return False, ORACLE_IMPORT_ERROR or "python-oracledb is not available on this interpreter."
+
+    if not _has_oracle_credentials(details):
+        return False, "Oracle credentials are incomplete; skipping automatic cache build."
+
+    connection = _open_oracle_connection(details, emit_messages=False)
+    if connection is None:
+        return False, "Oracle connection could not be established to build the cache."
+
+    try:
+        wells = _fetch_wells_from_connection(connection)
+    finally:
+        with contextlib.suppress(Exception):
+            connection.close()
+
+    success, message = _write_parquet_cache(wells)
+    mode = _determine_client_mode(details, options)
+    suffix = f" (Oracle {mode} mode)"
+    return success, message + suffix
+
+
+def build_cache_from_oracle() -> Tuple[bool, str]:
+    """Public helper that forces a parquet rebuild from Oracle data."""
+
+    return _try_build_parquet_from_oracle(force=True)
+
+
+def connect_to_db() -> Optional["oracledb.Connection"]:
+    details = _oracle_connection_details()
+    return _open_oracle_connection(details, emit_messages=True)
 
 
 @st.cache_data(show_spinner="Loading well master data...")
 def load_wells_from_db() -> pl.DataFrame:
-    connection = connect_to_db()
+    details = _oracle_connection_details()
+    connection = _open_oracle_connection(details, emit_messages=True)
     if connection is None:
         return pl.DataFrame()
 
-    query = """
-        SELECT W.UWI,
-               W.GSL_UWI,
-               W.SURFACE_LATITUDE,
-               W.SURFACE_LONGITUDE,
-               W.BOTTOM_HOLE_LATITUDE,
-               W.BOTTOM_HOLE_LONGITUDE,
-               W.GSL_FULL_LATERAL_LENGTH,
-               W.ABANDONMENT_DATE,
-               W.WELL_NAME,
-               W.CURRENT_STATUS,
-               W.OPERATOR AS OPERATOR_CODE,
-               W.CONFIDENTIAL_TYPE,
-               P.STRAT_UNIT_ID,
-               W.SPUD_DATE,
-               PFS.FIRST_PROD_DATE,
-               W.FINAL_TD,
-               W.PROVINCE_STATE,
-               W.COUNTRY,
-               FL.FIELD_NAME
-        FROM WELL W
-        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
-        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
-        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
-        WHERE W.SURFACE_LATITUDE IS NOT NULL
-          AND W.SURFACE_LONGITUDE IS NOT NULL
-          AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
-    """
-
     with contextlib.closing(connection) as conn:
-        frame = pd.read_sql(query, conn)
+        wells = _fetch_wells_from_connection(conn)
 
-    wells = pl.from_pandas(frame)
-    if "UWI" in wells.columns:
-        wells = wells.with_columns(standardize_uwi(wells["UWI"]).alias("UWI_STD"))
-    if "GSL_UWI" in wells.columns:
-        wells = wells.with_columns(standardize_uwi(wells["GSL_UWI"]).alias("GSL_UWI_STD"))
     return wells
 
 
@@ -833,6 +930,40 @@ def filter_wells(wells: pl.DataFrame) -> pl.DataFrame:
 def load_base_well_data() -> tuple[pl.DataFrame, str, list[DataSourceStatus]]:
     diagnostics: list[DataSourceStatus] = []
 
+    details = _oracle_connection_details()
+    options = _oracle_runtime_options()
+
+    if not PROCESSED_PARQUET.exists() and _has_oracle_credentials(details):
+        build_success, build_message = _auto_build_parquet_cache()
+        diagnostics.append(
+            DataSourceStatus(
+                "Parquet cache builder",
+                build_success,
+                build_message,
+                str(PROCESSED_PARQUET),
+            )
+        )
+
+    environment_diagnostics = _diagnose_oracle_environment(details, options)
+
+    db_data = pl.DataFrame()
+    if _has_oracle_credentials(details):
+        db_data = load_wells_from_db()
+
+    if not db_data.is_empty():
+        diagnostics.extend(environment_diagnostics)
+        diagnostics.append(
+            DataSourceStatus(
+                "Oracle connection",
+                True,
+                "Live connection succeeded using the configured credentials.",
+                details.get("dsn") if details else None,
+            )
+        )
+        return ensure_standard_identifiers(db_data), "oracle", diagnostics
+
+    diagnostics.extend(environment_diagnostics)
+
     cached = load_wells_from_parquet()
     if not cached.is_empty():
         diagnostics.append(
@@ -906,28 +1037,8 @@ def load_base_well_data() -> tuple[pl.DataFrame, str, list[DataSourceStatus]]:
             )
         )
 
-    details = _oracle_connection_details()
-    options = _oracle_runtime_options()
-    environment_diagnostics = _diagnose_oracle_environment(details, options)
-
-    db_data = load_wells_from_db()
-    if db_data.is_empty():
-        diagnostics.extend(environment_diagnostics)
-        st.warning("No well data available from cache or database.")
-        return ensure_standard_identifiers(db_data), "unavailable", diagnostics
-
-    diagnostics.extend(environment_diagnostics)
-    diagnostics.extend(
-        [
-            DataSourceStatus(
-                "Oracle connection",
-                True,
-                "Live connection succeeded using the configured credentials.",
-                details.get("dsn") if details else None,
-            ),
-        ]
-    )
-    return ensure_standard_identifiers(db_data), "oracle", diagnostics
+    st.warning("No well data available from cache or database.")
+    return ensure_standard_identifiers(pl.DataFrame()), "unavailable", diagnostics
 
 
 @st.cache_data(show_spinner="Fetching monthly production...")
@@ -1386,6 +1497,28 @@ def main() -> None:
         prevent the crashes we used to experience with single-threaded
         R pipelines.
         """
+    )
+
+    runtime_details = _oracle_connection_details()
+    runtime_options = _oracle_runtime_options()
+    client_mode = _determine_client_mode(runtime_details, runtime_options)
+    oracledb_status = "✅ python-oracledb detected" if oracledb else "❌ python-oracledb missing"
+    cache_status = (
+        f"✅ Cache found — {PROCESSED_PARQUET}"
+        if PROCESSED_PARQUET.exists()
+        else f"❌ Cache missing — {PROCESSED_PARQUET}"
+    )
+    active_dsn = runtime_details.get("dsn") or "<not configured>"
+    st.markdown(
+        "\n".join(
+            [
+                "**Runtime diagnostics**",
+                f"* Interpreter: `{sys.executable}`",
+                f"* {oracledb_status}",
+                f"* {cache_status}",
+                f"* Active DSN: `{active_dsn}` ({client_mode} mode)",
+            ]
+        )
     )
 
     base_wells, wells_source, diagnostics = load_base_well_data()
