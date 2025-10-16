@@ -20,6 +20,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable, Optional, Sequence
 
 import geopandas as gpd
@@ -65,6 +66,41 @@ def _load_optional_module(module_name: str) -> tuple[Optional[object], Optional[
 
 
 oracledb, ORACLE_IMPORT_ERROR, ORACLE_MODULE_PATH = _load_optional_module("oracledb")
+cx_oracle, CX_ORACLE_IMPORT_ERROR, CX_ORACLE_MODULE_PATH = _load_optional_module("cx_Oracle")
+USING_CX_ORACLE_SHIM = False
+
+
+def _promote_cx_oracle(module: object) -> tuple[object, Optional[str]]:
+    """Wrap cx_Oracle so the rest of the code can treat it like python-oracledb."""
+
+    namespace = SimpleNamespace(config_dir=None, wallet_location=None)
+
+    class OracleShim:
+        """Minimal wrapper translating python-oracledb attributes to cx_Oracle."""
+
+        def __init__(self, wrapped: object) -> None:
+            self._wrapped = wrapped
+            self.defaults = namespace
+            self.AUTH_MODE_DEFAULT = getattr(wrapped, "AUTH_MODE_DEFAULT", 0)
+            self.__version__ = f"cx_Oracle {getattr(wrapped, '__version__', 'unknown version')}"
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._wrapped, name)
+
+        def init_oracle_client(self, lib_dir: Optional[str] = None, config_dir: Optional[str] = None) -> None:
+            if hasattr(self._wrapped, "init_oracle_client"):
+                getattr(self._wrapped, "init_oracle_client")(lib_dir=lib_dir, config_dir=config_dir)
+
+    shim = OracleShim(module)
+    module_path = getattr(module, "__file__", None)
+    return shim, module_path
+
+
+if oracledb is None and cx_oracle is not None:
+    oracledb, ORACLE_MODULE_PATH = _promote_cx_oracle(cx_oracle)
+    ORACLE_IMPORT_ERROR = None
+    USING_CX_ORACLE_SHIM = True
+
 pyreadr, PYREADR_IMPORT_ERROR, PYREADR_MODULE_PATH = _load_optional_module("pyreadr")
 
 
@@ -75,26 +111,43 @@ BASE_PATH = Path(os.getenv("APP_BASE_PATH", Path.cwd()))
 CACHE_PATH = BASE_PATH / "cache"
 CACHE_PATH.mkdir(parents=True, exist_ok=True)
 
-PROCESSED_PARQUET = Path(
-    os.getenv(
-        "APP_PROCESSED_PARQUET",
-        BASE_PATH / "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.parquet",
-    )
+
+def _resolve_data_path(base: Path, candidate: Path) -> Path:
+    """Return an existing path when the provided candidate cannot be located."""
+
+    candidate = Path(candidate)
+    if candidate.exists():
+        return candidate
+
+    alt = base / candidate.name
+    if alt.exists():
+        return alt
+
+    with contextlib.suppress(Exception):
+        for match in base.rglob(candidate.name):
+            return match
+
+    return candidate
+
+
+DEFAULT_PARQUET = BASE_PATH / "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.parquet"
+DEFAULT_RDS = BASE_PATH / "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds"
+DEFAULT_COVERAGE = BASE_PATH / "Woodmack.Coverage.2024.xlsx"
+DEFAULT_SUBPLAY = BASE_PATH / "SubplayShapefile"
+DEFAULT_COMPANY_SHAPES = BASE_PATH / "Shapefile"
+
+PROCESSED_PARQUET = _resolve_data_path(
+    BASE_PATH, Path(os.getenv("APP_PROCESSED_PARQUET", str(DEFAULT_PARQUET)))
 )
-PROCESSED_RDS = Path(
-    os.getenv(
-        "APP_PROCESSED_RDS",
-        BASE_PATH / "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds",
-    )
+PROCESSED_RDS = _resolve_data_path(BASE_PATH, Path(os.getenv("APP_PROCESSED_RDS", str(DEFAULT_RDS))))
+WOODMACK_COVERAGE_EXCEL = _resolve_data_path(
+    BASE_PATH, Path(os.getenv("APP_WOODMACK_COVERAGE_XLSX", str(DEFAULT_COVERAGE)))
 )
-WOODMACK_COVERAGE_EXCEL = Path(
-    os.getenv("APP_WOODMACK_COVERAGE_XLSX", BASE_PATH / "Woodmack.Coverage.2024.xlsx")
+PLAY_SUBPLAY_PATH = _resolve_data_path(
+    BASE_PATH, Path(os.getenv("APP_SUBPLAY_SHAPEFILES", str(DEFAULT_SUBPLAY)))
 )
-PLAY_SUBPLAY_PATH = Path(
-    os.getenv("APP_SUBPLAY_SHAPEFILES", BASE_PATH / "SubplayShapefile")
-)
-COMPANY_SHAPEFILES_PATH = Path(
-    os.getenv("APP_COMPANY_SHAPEFILES", BASE_PATH / "Shapefile")
+COMPANY_SHAPEFILES_PATH = _resolve_data_path(
+    BASE_PATH, Path(os.getenv("APP_COMPANY_SHAPEFILES", str(DEFAULT_COMPANY_SHAPES)))
 )
 
 DEFAULT_CONNECTION = {
@@ -230,13 +283,33 @@ def _diagnose_oracle_environment(
                 ORACLE_MODULE_PATH,
             )
         )
+
+        if cx_oracle is not None:
+            diagnostics.append(
+                DataSourceStatus(
+                    "cx_Oracle",
+                    True,
+                    "cx_Oracle is installed but python-oracledb is not. The app can use cx_Oracle in compatibility mode.",
+                    CX_ORACLE_MODULE_PATH or getattr(cx_oracle, "__file__", None),
+                )
+            )
+        elif CX_ORACLE_IMPORT_ERROR:
+            diagnostics.append(
+                DataSourceStatus(
+                    "cx_Oracle",
+                    False,
+                    CX_ORACLE_IMPORT_ERROR,
+                    CX_ORACLE_MODULE_PATH,
+                )
+            )
         return diagnostics
 
+    module_label = "cx_Oracle compatibility layer" if USING_CX_ORACLE_SHIM else "python-oracledb"
     diagnostics.append(
         DataSourceStatus(
-            "python-oracledb",
+            module_label,
             True,
-            f"python-oracledb {getattr(oracledb, '__version__', 'unknown version')} is available.",
+            f"{module_label} {getattr(oracledb, '__version__', 'unknown version')} is available.",
             ORACLE_MODULE_PATH or getattr(oracledb, "__file__", None),
         )
     )
@@ -513,6 +586,12 @@ def connect_to_db() -> Optional["oracledb.Connection"]:
         return None
 
     _configure_oracle_client()
+
+    if USING_CX_ORACLE_SHIM:
+        st.info(
+            "python-oracledb is unavailable in this environment; using the cx_Oracle compatibility layer instead.",
+            icon="ℹ️",
+        )
 
     try:
         mode = details.get("mode") if details.get("mode") is not None else oracledb.AUTH_MODE_DEFAULT

@@ -56,7 +56,10 @@ GeoPandas to work with larger datasets without crashing.
    When connectivity fails, open the **Data source diagnostics** expander at
    the top of the Streamlit UI. It lists which files were discovered, whether
    the Oracle client configuration is valid (including `tnsnames.ora` lookup),
-   and which environment variables still need attention.
+   and which environment variables still need attention. The diagnostics also
+   report which Python module (`python-oracledb` or a compatibility layer on
+   top of `cx_Oracle`) satisfied the database dependency so you can verify
+   Streamlit is using the same interpreter where you installed the package.
 3. Launch the app:
    ```bash
    streamlit run app.py
@@ -69,9 +72,30 @@ loaded lazily from the shapefile directories.
 
 If neither a parquet snapshot nor a live database is available, placing
 the original RDS export in the application directory provides a
-zero-configuration offline option. The Streamlit port reads the RDS file
-with `pyreadr`, writes a parquet copy for subsequent runs, and exposes
-the same well metadata used in the Shiny application.
+zero-configuration offline option. The Streamlit port automatically scans
+the working directory tree for the legacy RDS/parquet filenames, reads the
+RDS file with `pyreadr`, writes a parquet copy for subsequent runs, and
+exposes the same well metadata used in the Shiny application.
+
+### Troubleshooting Oracle connectivity
+
+- Ensure the driver is installed in the same Python environment that launches
+  Streamlit by running:
+  ```bash
+  "$(python -c "import sys; print(sys.executable)")" -m pip install oracledb
+  ```
+  The diagnostics panel shows the interpreter path of the loaded module. If
+  Streamlit reports that `python-oracledb` is missing but you already
+  installed it elsewhere, re-run the command above inside the environment that
+  runs `streamlit`.
+- The app automatically falls back to a compatibility layer when only
+  `cx_Oracle` is available. While this provides the legacy behaviour, the
+  recommended setup uses `python-oracledb` because it supports both thin and
+  thick modes in a single package.
+- When you rely on a TNS alias, confirm that the alias exists in the reported
+  `tnsnames.ora` file and that `ORACLE_TNS_ADMIN` (or `TNS_ADMIN`) points to
+  the correct directory. The diagnostics expander will highlight missing or
+  unreadable files.
 
 ### Production analytics
 
