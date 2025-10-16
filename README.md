@@ -68,6 +68,22 @@ zero-configuration offline option. The Streamlit port reads the RDS file
 with `pyreadr`, writes a parquet copy for subsequent runs, and exposes
 the same well metadata used in the Shiny application.
 
+### Data source diagnostics
+
+The landing page now includes a **Data source diagnostics** expander that
+summarises the status of each upstream dependency:
+
+- whether the processed parquet cache exists and how many rows it holds
+- the presence of the legacy RDS snapshot and the `pyreadr` dependency
+- Oracle connectivity, reported with the active DSN, TNS configuration
+  directory, and any error returned by the driver
+
+Expand the panel when you see “No well data available from cache or
+database” to review targeted remediation steps. The Oracle entry also
+highlights common issues such as missing Instant Client libraries or an
+unresolved TNS alias so you can correct environment variables before
+re-running the app.
+
 ### Production analytics
 
 The Streamlit port now mirrors the analytical workflows offered in the

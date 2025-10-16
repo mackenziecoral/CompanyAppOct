@@ -220,6 +220,18 @@ class SpatialLayer:
     data: gpd.GeoDataFrame
 
 
+@dataclass
+class DataSourceStatus:
+    """Represents the availability of a given upstream data source."""
+
+    name: str
+    available: bool
+    message: str
+    details: dict[str, str] | None = None
+    hint: str | None = None
+    level: str = "info"
+
+
 def standardize_uwi(values: Iterable[str]) -> pl.Series:
     """Normalise UWI identifiers to uppercase alphanumerics."""
 
@@ -335,45 +347,115 @@ def load_wells_from_rds() -> pl.DataFrame:
     return wells
 
 
-def connect_to_db() -> Optional["oracledb.Connection"]:
-    if oracledb is None:
-        st.info(
-            "python-oracledb is not installed. Install it to enable live Oracle queries."
-        )
-        return None
+def _attempt_oracle_connection(test_mode: bool = False) -> tuple[Optional["oracledb.Connection"], DataSourceStatus]:
+    """Try to connect to Oracle and capture diagnostics regardless of outcome."""
 
     details = _oracle_connection_details()
+    runtime_options = _oracle_runtime_options()
+    diagnostics = {
+        "user": details.get("user") or "<unset>",
+        "dsn": details.get("dsn") or "<unset>",
+        "tns_admin": runtime_options.get("config_dir") or os.getenv("TNS_ADMIN", "<unset>"),
+    }
+    if runtime_options.get("wallet_dir"):
+        diagnostics["wallet_dir"] = runtime_options["wallet_dir"]
+    if runtime_options.get("lib_dir"):
+        diagnostics["lib_dir"] = runtime_options["lib_dir"]
+
+    if oracledb is None:
+        return None, DataSourceStatus(
+            name="Oracle database",
+            available=False,
+            message="python-oracledb is not installed. Install it to enable live queries.",
+            details=diagnostics,
+            level="info",
+        )
+
     missing = [key for key in ("user", "password", "dsn") if not details.get(key)]
     if missing:
-        st.warning(
-            "Missing Oracle connection details: "
-            + ", ".join(missing)
-            + ". Configure them via environment variables or Streamlit secrets."
+        return None, DataSourceStatus(
+            name="Oracle database",
+            available=False,
+            message="Missing Oracle connection details: " + ", ".join(missing),
+            details=diagnostics,
+            hint="Set ORACLE_USER, ORACLE_PASSWORD, and ORACLE_DSN environment variables or configure st.secrets['oracle'].",
+            level="warning",
         )
-        return None
 
     _configure_oracle_client()
 
     try:
         mode = details.get("mode") if details.get("mode") is not None else oracledb.AUTH_MODE_DEFAULT
-        return oracledb.connect(
+        connection = oracledb.connect(
             user=details["user"],
             password=details["password"],
             dsn=details["dsn"],
             mode=mode,
         )
     except Exception as exc:  # pragma: no cover - network / credentials
-        st.error(
-            "Unable to connect to Oracle: "
-            + str(exc)
-            + "\nVerify the DSN entry in tnsnames.ora and ensure credentials are correct."
-        )
+        diagnostics["error"] = str(exc)
+        hint = None
         if "ORA-12154" in str(exc):
-            st.info(
-                "ORA-12154 indicates the TNS alias could not be resolved. "
-                "Ensure TNS_ADMIN points to the folder containing tnsnames.ora."
+            hint = (
+                "ORA-12154 indicates the TNS alias could not be resolved. Ensure TNS_ADMIN points to the folder containing tnsnames.ora."
             )
-        return None
+        elif "DPI-1047" in str(exc):
+            hint = (
+                "DPI-1047 suggests the Oracle Instant Client libraries are not available. Install them or set ORACLE_CLIENT_LIB_DIR."
+            )
+        return None, DataSourceStatus(
+            name="Oracle database",
+            available=False,
+            message="Unable to connect to Oracle: " + str(exc),
+            details=diagnostics,
+            hint=hint,
+            level="error",
+        )
+
+    if test_mode:
+        with contextlib.suppress(Exception):
+            connection.close()
+        return None, DataSourceStatus(
+            name="Oracle database",
+            available=True,
+            message="Successfully connected to Oracle using the configured credentials.",
+            details=diagnostics,
+            level="success",
+        )
+
+    return connection, DataSourceStatus(
+        name="Oracle database",
+        available=True,
+        message="Successfully connected to Oracle using the configured credentials.",
+        details=diagnostics,
+        level="success",
+    )
+
+
+def connect_to_db() -> Optional["oracledb.Connection"]:
+    connection, status = _attempt_oracle_connection(test_mode=False)
+
+    if status.available:
+        return connection
+
+    log_message = status.message
+    if status.level == "info":
+        st.info(log_message)
+    elif status.level == "warning":
+        st.warning(log_message)
+    elif status.level == "success":  # pragma: no cover - not expected when unavailable
+        st.success(log_message)
+    else:
+        st.error(log_message)
+
+    if status.hint:
+        st.info(status.hint)
+
+    if status.details:
+        detail_lines = [f"{key}: {value}" for key, value in status.details.items()]
+        st.caption("\n".join(detail_lines))
+
+    return None
 
 
 @st.cache_data(show_spinner="Loading well master data...")
@@ -605,6 +687,116 @@ def load_base_well_data() -> tuple[pl.DataFrame, str]:
         st.warning("No well data available from cache or database.")
         return ensure_standard_identifiers(db_data), "unavailable"
     return ensure_standard_identifiers(db_data), "oracle"
+
+
+def gather_data_source_statuses() -> list[DataSourceStatus]:
+    """Inspect each upstream data source and summarise its availability."""
+
+    statuses: list[DataSourceStatus] = []
+
+    cached = load_wells_from_parquet()
+    if PROCESSED_PARQUET.exists():
+        message = (
+            f"{PROCESSED_PARQUET.name} contains {cached.height:,} rows."
+            if not cached.is_empty()
+            else "Parquet cache file found but it does not contain any rows."
+        )
+        statuses.append(
+            DataSourceStatus(
+                name="Parquet cache",
+                available=not cached.is_empty(),
+                message=message,
+                details={
+                    "path": str(PROCESSED_PARQUET),
+                    "last_modified": dt.datetime.fromtimestamp(
+                        PROCESSED_PARQUET.stat().st_mtime
+                    ).isoformat()
+                    if PROCESSED_PARQUET.exists()
+                    else "",
+                },
+                level="success" if not cached.is_empty() else "warning",
+                hint="Regenerate the parquet cache by loading data from Oracle or the RDS snapshot if it is empty.",
+            )
+        )
+    else:
+        statuses.append(
+            DataSourceStatus(
+                name="Parquet cache",
+                available=False,
+                message="No parquet cache found at the expected location.",
+                details={"expected_path": str(PROCESSED_PARQUET)},
+                hint="Provide a processed_app_data*.parquet file or allow the application to create one from Oracle/RDS data.",
+                level="warning",
+            )
+        )
+
+    if PROCESSED_RDS.exists():
+        if pyreadr is None:
+            statuses.append(
+                DataSourceStatus(
+                    name="Legacy RDS snapshot",
+                    available=False,
+                    message="RDS snapshot detected but the optional 'pyreadr' dependency is not installed.",
+                    details={"path": str(PROCESSED_RDS)},
+                    hint="Install pyreadr via 'pip install pyreadr' or 'conda install -c conda-forge pyreadr'.",
+                    level="warning",
+                )
+            )
+        else:
+            rds_snapshot = load_wells_from_rds()
+            statuses.append(
+                DataSourceStatus(
+                    name="Legacy RDS snapshot",
+                    available=not rds_snapshot.is_empty(),
+                    message=(
+                        f"RDS snapshot loaded with {rds_snapshot.height:,} rows."
+                        if not rds_snapshot.is_empty()
+                        else "RDS snapshot was read but produced no rows."
+                    ),
+                    details={"path": str(PROCESSED_RDS)},
+                    level="success" if not rds_snapshot.is_empty() else "warning",
+                    hint=None
+                    if not rds_snapshot.is_empty()
+                    else "Verify the RDS file matches the latest export from the R Shiny app.",
+                )
+            )
+    else:
+        statuses.append(
+            DataSourceStatus(
+                name="Legacy RDS snapshot",
+                available=False,
+                message="No RDS snapshot found at the expected location.",
+                details={"expected_path": str(PROCESSED_RDS)},
+                hint="Copy processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds into the application directory to enable the fallback.",
+                level="warning",
+            )
+        )
+
+    oracle_status = _attempt_oracle_connection(test_mode=True)[1]
+    statuses.append(oracle_status)
+
+    return statuses
+
+
+def render_data_source_diagnostics(wells_source: str) -> None:
+    """Display a human-readable summary of source availability for debugging."""
+
+    statuses = gather_data_source_statuses()
+    expanded = wells_source == "unavailable"
+    with st.expander("Data source diagnostics", expanded=expanded):
+        for status in statuses:
+            if status.available:
+                icon = "✅"
+            elif status.level == "error":
+                icon = "❌"
+            else:
+                icon = "⚠️"
+            st.markdown(f"{icon} **{status.name}:** {status.message}")
+            if status.hint:
+                st.caption(status.hint)
+            if status.details:
+                for key, value in status.details.items():
+                    st.caption(f"{key}: {value}")
 
 
 @st.cache_data(show_spinner="Fetching monthly production...")
@@ -1078,6 +1270,8 @@ def main() -> None:
         st.warning(
             "Well metadata could not be loaded. Configure Oracle access or provide a cache."
         )
+
+    render_data_source_diagnostics(wells_source)
     if wells.is_empty():
         st.stop()
 
