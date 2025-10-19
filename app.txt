@@ -1,0 +1,466 @@
+import streamlit as st
+import pandas as pd
+import geopandas as gpd
+import folium
+from streamlit_folium import st_folium
+from folium.plugins import MarkerCluster, Fullscreen
+import oracledb
+import os
+from pathlib import Path
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy.optimize import curve_fit
+import numpy as np
+from datetime import datetime, timedelta
+
+# --- 0. Page Configuration and Constants ---
+st.set_page_config(layout="wide", page_title="Interactive Well Map")
+
+# --- Oracle Client Path (UPDATE THIS) ---
+# Point this to the directory where you unzipped the Instant Client
+ORACLE_CLIENT_PATH = "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/InstantClient_64bit/instantclient_23_7" 
+
+# --- Database Connection Details (Use Streamlit Secrets for production) ---
+# For local development, you might use environment variables.
+# For Streamlit Community Cloud, use st.secrets
+try:
+    # Try to get secrets (for deployment)
+    DB_USER = st.secrets["database"]["user"]
+    DB_PASSWORD = st.secrets["database"]["password"]
+    TNS_ALIAS = st.secrets["database"]["tns_alias"]
+except (KeyError, FileNotFoundError):
+    # Fallback for local development (less secure)
+    st.warning("Database secrets not found. Using hardcoded values. Please configure secrets for production.")
+    DB_USER = "WOODMAC"
+    DB_PASSWORD = "c0pp3r"
+    TNS_ALIAS = "GDC_LINK.geologic.com"
+
+# --- File Paths and Constants (Update this path) ---
+# Use Path for better cross-platform compatibility
+BASE_PATH = Path("C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac/APP")
+PROCESSED_PARQUET_FILE = BASE_PATH / "processed_app_data.parquet"
+WOODMACK_COVERAGE_FILE_XLSX = BASE_PATH / "Woodmack.Coverage.2024.xlsx"
+PLAY_SUBPLAY_SHAPEFILE_DIR = BASE_PATH / "SubplayShapefile"
+COMPANY_SHAPEFILES_DIR = BASE_PATH / "Shapefile"
+
+# Conversion factors
+E3M3_TO_MCF = 35.3147
+M3_TO_BBL = 6.28981
+MCF_PER_BOE = 6
+
+# --- 1. Helper Functions ---
+def initialize_oracle_client():
+    """Initializes the Oracle client library path for the oracledb driver."""
+    try:
+        # st.write(f"Attempting to initialize Oracle Client from: {ORACLE_CLIENT_PATH}")
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_PATH)
+        # st.toast("Oracle Client initialized successfully.", icon="✅")
+        return True
+    except Exception as e:
+        # Check if the error is about the client already being initialized, which is not a failure
+        if "already been initialized" in str(e):
+            # st.toast("Oracle Client was already initialized.", icon="ℹ️")
+            return True
+        st.error(f"Failed to initialize Oracle Client from path: {ORACLE_CLIENT_PATH}")
+        st.error(f"Please check the ORACLE_CLIENT_PATH in the script and ensure the Instant Client is installed there.")
+        st.error(f"Detailed Error: {e}")
+        return False
+
+def standardize_uwi(uwi_series):
+    """Standardizes a pandas Series of UWI strings."""
+    if uwi_series is None:
+        return None
+    return uwi_series.astype(str).str.replace(r'[^A-Za-z0-9]', '', regex=True).str.upper()
+
+def get_db_connection():
+    """Establishes and returns an Oracle database connection."""
+    try:
+        # For remote connections, you might need the full connection string (DSN)
+        # dsn = oracledb.makedsn(hostname, port, service_name)
+        # For TNS_ALIAS, the DSN is simply the alias if your tnsnames.ora is configured
+        conn = oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=TNS_ALIAS)
+        st.toast("Successfully connected to Oracle database.", icon="✅")
+        return conn
+    except Exception as e:
+        st.error(f"Database Connection Error: Could not connect to Oracle. Please check credentials and network.")
+        st.error(f"Detailed Error: {e}")
+        return None
+
+def load_spatial_layer(shp_path, simplify_tolerance=None):
+    """Loads and processes a single shapefile into a GeoDataFrame."""
+    if not shp_path.exists():
+        st.warning(f"Shapefile not found: {shp_path}")
+        return None
+    try:
+        gdf = gpd.read_file(shp_path)
+        if gdf.empty:
+            return None
+        # Reproject to standard WGS84 for Leaflet
+        if gdf.crs and gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs(epsg=4326)
+        
+        # Improve performance and fix potential issues
+        gdf['geometry'] = gdf.geometry.make_valid()
+        if simplify_tolerance:
+            gdf['geometry'] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
+            
+        return gdf
+    except Exception as e:
+        st.error(f"Error processing shapefile {shp_path.name}: {e}")
+        return None
+
+# --- 2. Main Data Loading and Caching ---
+# This is the most critical function for performance.
+# It caches the result, so the expensive DB queries and file I/O
+# only run once, or when the underlying code changes.
+@st.cache_data(ttl=3600)  # Cache data for 1 hour
+def load_data():
+    """
+    Loads all necessary data from the database and files.
+    Caches the processed data to a Parquet file for faster subsequent loads.
+    """
+    if PROCESSED_PARQUET_FILE.exists():
+        try:
+            st.toast("Loading cached data from Parquet file...", icon="📁")
+            data = pd.read_parquet(PROCESSED_PARQUET_FILE)
+            wells_gdf = gpd.GeoDataFrame(
+                data.drop(columns=['geometry']),
+                geometry=gpd.GeoSeries.from_wkb(data['geometry']),
+                crs="EPSG:4326"
+            )
+            # Load shapefiles separately as they are not easily stored in one parquet
+        except Exception as e:
+            st.warning(f"Could not read cached Parquet file ({e}). Re-loading from source.")
+            wells_gdf = None
+    else:
+        wells_gdf = None
+
+    if wells_gdf is None:
+        st.info("No cached data found. Loading from database and shapefiles. This may take a moment.")
+        
+        conn = get_db_connection()
+        if conn is None:
+            return None, {}, {} # Return empty structures on DB fail
+
+        # Fetch well master data
+        sql_well_master = """
+        SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
+               W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
+               W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE,
+               P.STRAT_UNIT_ID, W.SPUD_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
+        FROM WELL W
+        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
+        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
+        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
+        WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL
+        AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
+        """
+        wells_master_df = pd.read_sql(sql_well_master, conn)
+
+        # Fetch strat unit names (formations)
+        unique_strat_ids = wells_master_df['STRAT_UNIT_ID'].dropna().unique().tolist()
+        if unique_strat_ids:
+            # Oracle has a limit of 1000 items in an IN clause
+            strat_names_df_list = []
+            for i in range(0, len(unique_strat_ids), 999):
+                batch_ids = unique_strat_ids[i:i+999]
+                sql_strat = f"SELECT STRAT_UNIT_ID, SHORT_NAME FROM STRAT_UNIT WHERE STRAT_UNIT_ID IN ({','.join(map(str, batch_ids))})"
+                strat_names_df_list.append(pd.read_sql(sql_strat, conn))
+            strat_names_df = pd.concat(strat_names_df_list, ignore_index=True)
+            wells_master_df = pd.merge(wells_master_df, strat_names_df, on='STRAT_UNIT_ID', how='left')
+
+        conn.close()
+
+        # Load operator names from Excel
+        operator_codes_df = pd.read_excel(WOODMACK_COVERAGE_FILE_XLSX, sheet_name="Operator")
+        operator_map = operator_codes_df.set_index('OPERATOR')['GSL_PARENT_BA_NAME']
+        wells_master_df['OperatorName'] = wells_master_df['OPERATOR_CODE'].map(operator_map)
+
+        # Clean up columns and standardize
+        wells_master_df.rename(columns={
+            'SURFACE_LATITUDE': 'SurfaceLatitude', 'SURFACE_LONGITUDE': 'SurfaceLongitude',
+            'BOTTOM_HOLE_LATITUDE': 'BH_Latitude', 'BOTTOM_HOLE_LONGITUDE': 'BH_Longitude',
+            'GSL_FULL_LATERAL_LENGTH': 'LateralLength', 'WELL_NAME': 'WellName',
+            'CURRENT_STATUS': 'CurrentStatus', 'SHORT_NAME': 'Formation',
+            'FIRST_PROD_DATE': 'FirstProdDate', 'PROVINCE_STATE': 'ProvinceState',
+            'FIELD_NAME': 'FieldName'
+        }, inplace=True)
+        
+        wells_master_df['UWI_Std'] = standardize_uwi(wells_master_df['UWI'])
+        wells_master_df['GSL_UWI_Std'] = standardize_uwi(wells_master_df['GSL_UWI'])
+        
+        # Convert to GeoDataFrame
+        wells_gdf = gpd.GeoDataFrame(
+            wells_master_df,
+            geometry=gpd.points_from_xy(wells_master_df.SurfaceLongitude, wells_master_df.SurfaceLatitude),
+            crs="EPSG:4269" # Assuming NAD83, common for North America
+        ).to_crs("EPSG:4326") # Convert to WGS84 for web maps
+        
+        # Save to cache
+        try:
+            # Convert geometry to WKB (Well-Known Binary) for Parquet compatibility
+            wells_gdf_to_save = wells_gdf.copy()
+            wells_gdf_to_save['geometry'] = wells_gdf_to_save['geometry'].to_wkb()
+            wells_gdf_to_save.to_parquet(PROCESSED_PARQUET_FILE)
+            st.toast("Source data loaded and cached to Parquet file.", icon="💾")
+        except Exception as e:
+            st.warning(f"Failed to save cache file: {e}")
+
+    # Load shapefiles every time (they are usually smaller and can change)
+    play_subplay_layers = {}
+    if PLAY_SUBPLAY_SHAPEFILE_DIR.is_dir():
+        for shp_file in PLAY_SUBPLAY_SHAPEFILE_DIR.glob("**/*.shp"):
+            layer_name = shp_file.stem
+            gdf = load_spatial_layer(shp_file, simplify_tolerance=0.001)
+            if gdf is not None:
+                play_subplay_layers[layer_name] = gdf
+
+    company_layers = {}
+    if COMPANY_SHAPEFILES_DIR.is_dir():
+        for shp_file in COMPANY_SHAPEFILES_DIR.glob("*.shp"):
+            layer_name = shp_file.stem
+            gdf = load_spatial_layer(shp_file)
+            if gdf is not None:
+                company_layers[layer_name] = gdf
+
+    return wells_gdf, play_subplay_layers, company_layers
+
+# --- 3. Arps Decline Curve Functions ---
+def hyperbolic(t, qi, di, b):
+    return qi / (1 + b * di * t)**(1 / b)
+
+def exponential(t, qi, di):
+    return qi * np.exp(-di * t)
+
+def harmonic(t, qi, di):
+    return qi / (1 + di * t)
+
+# --- App UI and Logic ---
+
+# Initialize the Oracle client before any DB operations
+initialize_oracle_client()
+
+# Load all data
+wells_gdf, play_subplay_layers, company_layers = load_data()
+
+if wells_gdf is None:
+    st.error("Failed to load well data. The application cannot continue.")
+    st.stop()
+    
+# Convert date columns after loading
+wells_gdf['FirstProdDate'] = pd.to_datetime(wells_gdf['FirstProdDate'], errors='coerce')
+wells_gdf['FirstProdYear'] = wells_gdf['FirstProdDate'].dt.year.astype('Int64').astype(str)
+
+# --- Sidebar Filters ---
+with st.sidebar:
+    st.header("Well Selection Criteria")
+    
+    # Prepare filter choices
+    op_choices = sorted(wells_gdf['OperatorName'].dropna().unique())
+    form_choices = sorted(wells_gdf['Formation'].dropna().unique())
+    field_choices = sorted(wells_gdf['FieldName'].dropna().unique())
+    prov_choices = sorted(wells_gdf['ProvinceState'].dropna().unique())
+
+    selected_operators = st.multiselect("Operator:", op_choices, placeholder="Filter by Operator...")
+    selected_formations = st.multiselect("Formation:", form_choices, placeholder="Filter by Formation...")
+    selected_fields = st.multiselect("Field:", field_choices, placeholder="Filter by Field...")
+    selected_provinces = st.multiselect("Province/State:", prov_choices, placeholder="Filter by Province/State...")
+
+    min_date = wells_gdf['FirstProdDate'].min()
+    max_date = wells_gdf['FirstProdDate'].max()
+    
+    selected_date_range = st.date_input(
+        "Filter by First Production Date:",
+        value=(max_date - timedelta(days=365*10), max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+
+    st.header("Map Layers")
+    selected_play_layers = st.multiselect("Play/Subplay Boundaries:", list(play_subplay_layers.keys()))
+    selected_company_layers = st.multiselect("Company Acreage:", list(company_layers.keys()))
+
+# --- Filtering Logic ---
+filtered_gdf = wells_gdf.copy()
+
+if selected_operators:
+    filtered_gdf = filtered_gdf[filtered_gdf['OperatorName'].isin(selected_operators)]
+if selected_formations:
+    filtered_gdf = filtered_gdf[filtered_gdf['Formation'].isin(selected_formations)]
+if selected_fields:
+    filtered_gdf = filtered_gdf[filtered_gdf['FieldName'].isin(selected_fields)]
+if selected_provinces:
+    filtered_gdf = filtered_gdf[filtered_gdf['ProvinceState'].isin(selected_provinces)]
+if len(selected_date_range) == 2:
+    start_date, end_date = pd.to_datetime(selected_date_range[0]), pd.to_datetime(selected_date_range[1])
+    filtered_gdf = filtered_gdf[filtered_gdf['FirstProdDate'].between(start_date, end_date)]
+
+
+# --- Main Panel with Tabs ---
+tab1, tab2 = st.tabs(["Well Map", "Production Analysis"])
+
+with tab1:
+    st.subheader(f"Displaying {len(filtered_gdf):,} of {len(wells_gdf):,} Wells")
+    
+    # Create map centered on the data
+    if not filtered_gdf.empty:
+        map_center = [filtered_gdf['SurfaceLatitude'].mean(), filtered_gdf['SurfaceLongitude'].mean()]
+        zoom_start = 6
+    else:
+        map_center = [55, -106] # Default center of Canada
+        zoom_start = 4
+
+    m = folium.Map(location=map_center, zoom_start=zoom_start, tiles="CartoDB positron")
+
+    # Add layer controls
+    folium.TileLayer('OpenStreetMap').add_to(m)
+    folium.TileLayer('Esri.WorldImagery', name='Satellite').add_to(m)
+    
+    # Add Acreage Layers
+    if selected_play_layers:
+        play_fg = folium.FeatureGroup(name="Play/Subplay Acreage", show=True).add_to(m)
+        for name in selected_play_layers:
+            folium.GeoJson(
+                play_subplay_layers[name],
+                style_function=lambda x: {'color': 'blue', 'weight': 1.5, 'fillOpacity': 0.1},
+                tooltip=name
+            ).add_to(play_fg)
+
+    if selected_company_layers:
+        company_fg = folium.FeatureGroup(name="Company Acreage", show=True).add_to(m)
+        for name in selected_company_layers:
+            folium.GeoJson(
+                company_layers[name],
+                style_function=lambda x: {'color': 'red', 'weight': 1.5, 'fillOpacity': 0.1},
+                tooltip=name
+            ).add_to(company_fg)
+
+    # Add Wells (use MarkerCluster for performance)
+    if not filtered_gdf.empty:
+        well_fg = folium.FeatureGroup(name="Wells (Surface Location)", show=True).add_to(m)
+        cluster = MarkerCluster().add_to(well_fg)
+        
+        for idx, row in filtered_gdf.iterrows():
+            popup_html = f"""
+            <b>UWI:</b> {row['UWI']}<br>
+            <b>Well Name:</b> {row['WellName']}<br>
+            <b>Operator:</b> {row['OperatorName']}<br>
+            <b>Formation:</b> {row['Formation']}<br>
+            <b>Status:</b> {row['CurrentStatus']}
+            """
+            folium.CircleMarker(
+                location=[row['SurfaceLatitude'], row['SurfaceLongitude']],
+                radius=4,
+                color='green',
+                fill=True,
+                fill_color='green',
+                fill_opacity=0.6,
+                popup=folium.Popup(popup_html, max_width=300)
+            ).add_to(cluster)
+
+        # Add Well Sticks (Lateral Paths)
+        sticks_fg = folium.FeatureGroup(name="Well Sticks", show=False).add_to(m)
+        wells_with_laterals = filtered_gdf.dropna(subset=['BH_Latitude', 'BH_Longitude'])
+        for idx, row in wells_with_laterals.iterrows():
+            folium.PolyLine(
+                locations=[
+                    (row['SurfaceLatitude'], row['SurfaceLongitude']),
+                    (row['BH_Latitude'], row['BH_Longitude'])
+                ],
+                color='black',
+                weight=1.5
+            ).add_to(sticks_fg)
+
+    folium.LayerControl().add_to(m)
+    Fullscreen().add_to(m)
+
+    # Display the map
+    map_data = st_folium(m, width='100%', height=700)
+
+with tab2:
+    st.header("Production Analysis")
+    st.info("Analysis is based on the wells currently selected by the filters on the left.")
+
+    analysis_tabs = st.tabs(["Single Well Analysis", "Filtered Group Cumulative", "Type Curve Analysis (Arps)"])
+
+    with analysis_tabs[0]:
+        st.subheader("Single Well Production")
+        well_options = {f"{row.WellName} ({row.UWI})": row.GSL_UWI_Std for idx, row in filtered_gdf.iterrows()}
+        selected_well_display = st.selectbox("Select a Well:", list(well_options.keys()), index=None, placeholder="Choose a well from the filtered list...")
+
+        if selected_well_display:
+            gsl_uwi_std = well_options[selected_well_display]
+            # In a real app, you would now query the DB for this well's production
+            st.write(f"Displaying production for GSL_UWI_Std: **{gsl_uwi_std}**")
+            st.warning("Live single-well production data fetching from the database is not implemented in this version.")
+            # Placeholder for plot
+            fig = go.Figure()
+            fig.update_layout(title="Single Well Production Plot (Placeholder)", xaxis_title="Date", yaxis_title="Rate")
+            st.plotly_chart(fig)
+
+    with analysis_tabs[1]:
+        st.subheader("Filtered Group Cumulative Production")
+        group_by_col = st.selectbox(
+            "Group By:",
+            options=['OperatorName', 'Formation', 'FieldName', 'ProvinceState', 'FirstProdYear'],
+            format_func=lambda x: {'OperatorName': 'Operator', 'Formation': 'Formation', 'FieldName': 'Field', 'ProvinceState': 'Province/State', 'FirstProdYear': 'First Production Year'}[x]
+        )
+        
+        st.warning("Live group production data fetching is complex and not implemented in this version.")
+        # Placeholder for plot
+        if not filtered_gdf.empty and group_by_col:
+            # This is a mock plot based on well count, not real production
+            st.write(f"This is a placeholder plot. A real implementation would query production for all {len(filtered_gdf)} wells and aggregate.")
+            group_counts = filtered_gdf[group_by_col].value_counts().nlargest(10)
+            fig = px.bar(
+                group_counts, 
+                x=group_counts.index, 
+                y=group_counts.values,
+                title=f"Well Count by {group_by_col} (Top 10)",
+                labels={'x': group_by_col, 'y': 'Number of Wells'}
+            )
+            st.plotly_chart(fig)
+
+
+    with analysis_tabs[2]:
+        st.subheader("Type Curve Analysis (Arps)")
+        st.warning("Arps curve fitting requires production data, which is not fetched in this version. This section is a placeholder.")
+        
+        arps_model_type = st.selectbox("Select Arps Model:", ["Hyperbolic", "Exponential", "Harmonic"])
+        
+        if st.button("Generate Type Curve"):
+            st.info("Generating a placeholder type curve.")
+            # Generate some sample data for demonstration
+            t_data = np.linspace(1, 36, 36)
+            # Create some "noisy" hyperbolic data
+            y_data = hyperbolic(t_data, qi=100, di=0.2, b=1.2) + np.random.normal(0, 5, len(t_data))
+            
+            try:
+                if arps_model_type == "Hyperbolic":
+                    popt, _ = curve_fit(hyperbolic, t_data, y_data, p0=[120, 0.25, 1.0], bounds=([0, 0, 0], [np.inf, 1, 2]))
+                    fit_y = hyperbolic(t_data, *popt)
+                    params_str = f"Qi: {popt[0]:.2f}, Di: {popt[1]:.3f}, b: {popt[2]:.2f}"
+                elif arps_model_type == "Exponential":
+                    popt, _ = curve_fit(exponential, t_data, y_data, p0=[120, 0.25], bounds=([0, 0], [np.inf, 1]))
+                    fit_y = exponential(t_data, *popt)
+                    params_str = f"Qi: {popt[0]:.2f}, Di: {popt[1]:.3f}"
+                else: # Harmonic
+                    popt, _ = curve_fit(harmonic, t_data, y_data, p0=[120, 0.25], bounds=([0, 0], [np.inf, 1]))
+                    fit_y = harmonic(t_data, *popt)
+                    params_str = f"Qi: {popt[0]:.2f}, Di: {popt[1]:.3f}"
+
+                # Plotting
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=t_data, y=y_data, mode='markers', name='Actual Data (Sample)'))
+                fig.add_trace(go.Scatter(x=t_data, y=fit_y, mode='lines', name='Fitted Curve', line=dict(color='red', dash='dash')))
+                fig.update_layout(
+                    title=f"{arps_model_type} Type Curve (Sample Data)",
+                    xaxis_title="Months on Production",
+                    yaxis_title="Rate",
+                    annotations=[dict(x=0.5, y=0.8, xref='paper', yref='paper', text=f"Fitted Params: {params_str}", showarrow=False)]
+                )
+                st.plotly_chart(fig)
+            except RuntimeError:
+                st.error("Could not fit the model to the sample data. Try again.")
+
+
