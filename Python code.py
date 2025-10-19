@@ -73,11 +73,11 @@ def connect_to_db():
 
     try:
         print(f"Attempting to connect to Oracle: {TNS_ALIAS} as user: {DB_USER}")
-        
+
         # Note: The oracledb.init_oracle_client() might be needed if the Oracle Instant Client
         # is not in your system's PATH or LD_LIBRARY_PATH. For example:
         # oracledb.init_oracle_client(lib_dir="C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/InstantClient_64bit/instantclient_23_7")
-        
+
         engine = create_engine(
             CONNECTION_STRING,
             echo=False  # Set to True for debugging SQL queries
@@ -86,11 +86,39 @@ def connect_to_db():
         with engine.connect() as conn:
             print("SUCCESS: Database connection established.")
         return engine
+    except TypeError as e:
+        error_text = str(e)
+        if "timeout" in error_text.lower():
+            print("Encountered Oracle driver timeout argument incompatibility. Retrying without timeout keyword.")
+
+            def _connect_without_timeout():
+                return oracledb.connect(
+                    user=DB_USER,
+                    password=DB_PASSWORD,
+                    dsn=TNS_ALIAS,
+                )
+
+            try:
+                engine = create_engine(
+                    "oracle+oracledb://",
+                    creator=_connect_without_timeout,
+                    echo=False,
+                )
+                with engine.connect() as conn:
+                    print("SUCCESS: Database connection established via timeout-safe path.")
+                return engine
+            except Exception as inner_exc:
+                print("ERROR: Retrying Oracle connection without timeout keyword failed.")
+                print(f"Detailed Python error: {inner_exc}")
+        else:
+            print("ERROR during create_engine or connect call: Failed to connect to Oracle.")
+            print(f"Detailed Python error: {e}")
     except Exception as e:
         print(f"ERROR during create_engine or connect call: Failed to connect to Oracle.")
         print(f"Detailed Python error: {e}")
-        engine = None
-        return None
+
+    engine = None
+    return None
 
 # Initial connection attempt when the app starts.
 engine = connect_to_db()
