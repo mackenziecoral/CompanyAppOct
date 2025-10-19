@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 import oracledb
 from scipy.optimize import curve_fit
 from shiny.types import FileInfo
@@ -80,39 +80,24 @@ def connect_to_db():
 
         engine = create_engine(
             CONNECTION_STRING,
-            echo=False  # Set to True for debugging SQL queries
+            echo=False,  # Set to True for debugging SQL queries
+            pool_pre_ping=True,
+            pool_recycle=3600,
         )
+
+        @event.listens_for(engine, "connect")
+        def _set_call_timeout(dbapi_conn, conn_record):
+            """Apply a per-statement timeout when supported by python-oracledb."""
+            try:
+                dbapi_conn.call_timeout = 30000  # 30 seconds expressed in milliseconds
+            except Exception:
+                # Older client libraries may not expose call_timeout; ignore silently.
+                pass
+
         # Test the connection to confirm it was established.
         with engine.connect() as conn:
             print("SUCCESS: Database connection established.")
         return engine
-    except TypeError as e:
-        error_text = str(e)
-        if "timeout" in error_text.lower():
-            print("Encountered Oracle driver timeout argument incompatibility. Retrying without timeout keyword.")
-
-            def _connect_without_timeout():
-                return oracledb.connect(
-                    user=DB_USER,
-                    password=DB_PASSWORD,
-                    dsn=TNS_ALIAS,
-                )
-
-            try:
-                engine = create_engine(
-                    "oracle+oracledb://",
-                    creator=_connect_without_timeout,
-                    echo=False,
-                )
-                with engine.connect() as conn:
-                    print("SUCCESS: Database connection established via timeout-safe path.")
-                return engine
-            except Exception as inner_exc:
-                print("ERROR: Retrying Oracle connection without timeout keyword failed.")
-                print(f"Detailed Python error: {inner_exc}")
-        else:
-            print("ERROR during create_engine or connect call: Failed to connect to Oracle.")
-            print(f"Detailed Python error: {e}")
     except Exception as e:
         print(f"ERROR during create_engine or connect call: Failed to connect to Oracle.")
         print(f"Detailed Python error: {e}")
