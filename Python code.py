@@ -80,7 +80,6 @@ def connect_to_db():
         
         engine = create_engine(
             CONNECTION_STRING,
-            connect_args={"timeout": 10},
             echo=False  # Set to True for debugging SQL queries
         )
         # Test the connection to confirm it was established.
