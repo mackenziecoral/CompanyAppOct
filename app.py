@@ -162,6 +162,7 @@ def read_sql_resilient(sql_text, params=None, max_retries=1):
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / "data"
 PROCESSED_DATA_FILE = DATA_DIR / "processed_app_data.pkl"
+APP_DATA_CACHE_VERSION = 2
 
 PLAY_SUBPLAY_SHAPEFILE_DIR = APP_ROOT / "SubplayShapefile"
 COMPANY_SHAPEFILES_DIR = APP_ROOT / "Shapefile"
@@ -891,7 +892,7 @@ def load_and_process_all_data():
         try:
             embedded_bytes = base64.b64decode(EMBEDDED_APP_DATA_B64)
             loaded_data = pickle.loads(embedded_bytes)
-            if isinstance(loaded_data, dict):
+            if isinstance(loaded_data, dict) and loaded_data.get('__version__') == APP_DATA_CACHE_VERSION:
                 play_layers = loaded_data.get('play_subplay_layers_list', [])
                 company_layers = loaded_data.get('company_layers_list', [])
                 if isinstance(play_layers, list) and play_layers:
@@ -899,6 +900,8 @@ def load_and_process_all_data():
                 if isinstance(company_layers, list) and company_layers:
                     app_data['company_layers_list'] = company_layers
                 print("SUCCESS: Loaded shapefile layers from embedded payload.")
+            else:
+                print("INFO: Embedded shapefile payload missing or outdated; will refresh from source files.")
         except Exception as exc:
             print(f"WARNING: Unable to hydrate embedded shapefiles ({exc}).")
 
@@ -907,7 +910,7 @@ def load_and_process_all_data():
         try:
             with open(PROCESSED_DATA_FILE, 'rb') as f:
                 loaded_data = pickle.load(f)
-            if isinstance(loaded_data, dict):
+            if isinstance(loaded_data, dict) and loaded_data.get('__version__') == APP_DATA_CACHE_VERSION:
                 play_layers = loaded_data.get('play_subplay_layers_list', [])
                 company_layers = loaded_data.get('company_layers_list', [])
                 if isinstance(play_layers, list) and play_layers:
@@ -915,6 +918,8 @@ def load_and_process_all_data():
                 if isinstance(company_layers, list) and company_layers:
                     app_data['company_layers_list'] = company_layers
                 print("SUCCESS: Loaded shapefile layers from cache.")
+            else:
+                print("INFO: Cached shapefile payload missing or outdated; will refresh from source files.")
         except Exception as e:
             print(f"WARNING: Unable to load cached data ({e}). Will rebuild from source files.")
 
@@ -930,8 +935,7 @@ def load_and_process_all_data():
                         gdf = load_process_spatial_layer(
                             shp_path,
                             layer_name,
-                            simplify=True,
-                            tolerance=100,
+                            simplify=False,
                             make_valid_geom=True,
                         )
                         if gdf is not None:
@@ -961,6 +965,7 @@ def load_and_process_all_data():
             'wells_gdf': empty_gdf,
             'play_subplay_layers_list': app_data['play_subplay_layers_list'],
             'company_layers_list': app_data['company_layers_list'],
+            '__version__': APP_DATA_CACHE_VERSION,
         }
         PROCESSED_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(PROCESSED_DATA_FILE, 'wb') as f:
