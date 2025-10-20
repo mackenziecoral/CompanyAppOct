@@ -4,6 +4,7 @@ import re
 import math
 import warnings
 import html
+import base64
 from datetime import datetime, date, timedelta
 import pickle
 from itertools import cycle
@@ -12,6 +13,7 @@ import textwrap
 import sys
 import urllib.parse
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -26,6 +28,11 @@ import pydeck as pdk
 import plotly.graph_objects as go
 import plotnine as p9
 from operator_coverage_data import OPERATOR_COVERAGE
+
+try:
+    from embedded_app_data import EMBEDDED_APP_DATA_B64
+except ImportError:
+    EMBEDDED_APP_DATA_B64 = None
 
 # --- Database Connection Details ---
 # (REPLACEMENT BLOCK: use python-oracledb in Thick mode with your Instant Client)
@@ -150,13 +157,14 @@ def read_sql_resilient(sql_text, params=None, max_retries=1):
 # stale connections and recycling.
 
 # --- 1. Define File Paths and Constants ---
-# UPDATE THIS PATH TO YOUR LOCAL DIRECTORY
-BASE_PATH = "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac/APP" 
-# Using .pkl (pickle) is a common Python format for saving data structures like DataFrames
-PROCESSED_DATA_FILE = os.path.join(BASE_PATH, "processed_app_data.pkl")
+# All static assets live next to the app source so the tool can ship with
+# pre-processed spatial layers instead of touching raw shapefiles at runtime.
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = APP_ROOT / "data"
+PROCESSED_DATA_FILE = DATA_DIR / "processed_app_data.pkl"
 
-PLAY_SUBPLAY_SHAPEFILE_DIR = os.path.join(BASE_PATH, "SubplayShapefile")
-COMPANY_SHAPEFILES_DIR = os.path.join(BASE_PATH, "Shapefile")
+PLAY_SUBPLAY_SHAPEFILE_DIR = APP_ROOT / "SubplayShapefile"
+COMPANY_SHAPEFILES_DIR = APP_ROOT / "Shapefile"
 
 # Conversion factors
 E3M3_TO_MCF = 35.3147
@@ -194,11 +202,11 @@ def _render_plotly_chart(fig):
             category=FutureWarning,
         )
         try:
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
             return
         except TypeError:
-            # Older Streamlit versions may not support the ``width`` keyword.
-            st.plotly_chart(fig)
+            # Older Streamlit versions may not support ``use_container_width``.
+            st.plotly_chart(fig, config={"responsive": True})
 
 
 def _render_dataframe(df: pd.DataFrame):
@@ -803,17 +811,18 @@ def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "co
     
     return unique_choices
 
-def load_process_spatial_layer(shp_path: str, layer_name: str, target_crs: int = 4326, 
-                               simplify: bool = False, tolerance: float = None, 
+def load_process_spatial_layer(shp_path: str | Path, layer_name: str, target_crs: int = 4326,
+                               simplify: bool = False, tolerance: float = None,
                                make_valid_geom: bool = False) -> gpd.GeoDataFrame | None:
     """ Replaces R 'load_process_spatial_layer' using GeoPandas. """
+    shp_path = Path(shp_path)
     print(f"--- Start Processing Layer: {layer_name} ---")
     print(f"Shapefile path: {shp_path}")
     try:
-        if not os.path.exists(shp_path):
+        if not shp_path.exists():
             warnings.warn(f"Shapefile does not exist at path: {shp_path} for layer {layer_name}")
             return None
-        
+
         data_gdf = gpd.read_file(shp_path)
         if data_gdf.empty:
             warnings.warn(f"Shapefile for layer {layer_name} is empty.")
@@ -878,7 +887,22 @@ def load_and_process_all_data():
         'company_layers_list': []
     }
 
-    if os.path.exists(PROCESSED_DATA_FILE):
+    if EMBEDDED_APP_DATA_B64:
+        try:
+            embedded_bytes = base64.b64decode(EMBEDDED_APP_DATA_B64)
+            loaded_data = pickle.loads(embedded_bytes)
+            if isinstance(loaded_data, dict):
+                play_layers = loaded_data.get('play_subplay_layers_list', [])
+                company_layers = loaded_data.get('company_layers_list', [])
+                if isinstance(play_layers, list) and play_layers:
+                    app_data['play_subplay_layers_list'] = play_layers
+                if isinstance(company_layers, list) and company_layers:
+                    app_data['company_layers_list'] = company_layers
+                print("SUCCESS: Loaded shapefile layers from embedded payload.")
+        except Exception as exc:
+            print(f"WARNING: Unable to hydrate embedded shapefiles ({exc}).")
+
+    if PROCESSED_DATA_FILE.exists():
         print(f"Attempting to load cached layers from: {PROCESSED_DATA_FILE}")
         try:
             with open(PROCESSED_DATA_FILE, 'rb') as f:
@@ -897,12 +921,12 @@ def load_and_process_all_data():
     if not app_data['play_subplay_layers_list']:
         print("--- Loading Play/Subplay Acreage ---")
         play_layers: list[dict] = []
-        if os.path.isdir(PLAY_SUBPLAY_SHAPEFILE_DIR):
+        if PLAY_SUBPLAY_SHAPEFILE_DIR.is_dir():
             for root_dir, _, files in os.walk(PLAY_SUBPLAY_SHAPEFILE_DIR):
                 for filename in files:
                     if filename.lower().endswith('.shp'):
-                        shp_path = os.path.join(root_dir, filename)
-                        layer_name = os.path.splitext(filename)[0]
+                        shp_path = Path(root_dir) / filename
+                        layer_name = Path(filename).stem
                         gdf = load_process_spatial_layer(
                             shp_path,
                             layer_name,
@@ -917,11 +941,11 @@ def load_and_process_all_data():
     if not app_data['company_layers_list']:
         print("--- Loading DISSOLVED Company Acreage ---")
         company_layers: list[dict] = []
-        if os.path.isdir(COMPANY_SHAPEFILES_DIR):
+        if COMPANY_SHAPEFILES_DIR.is_dir():
             for filename in os.listdir(COMPANY_SHAPEFILES_DIR):
                 if filename.lower().endswith('.shp'):
-                    shp_path = os.path.join(COMPANY_SHAPEFILES_DIR, filename)
-                    layer_name = os.path.splitext(filename)[0]
+                    shp_path = COMPANY_SHAPEFILES_DIR / filename
+                    layer_name = Path(filename).stem
                     gdf = load_process_spatial_layer(
                         shp_path,
                         layer_name,
@@ -938,6 +962,7 @@ def load_and_process_all_data():
             'play_subplay_layers_list': app_data['play_subplay_layers_list'],
             'company_layers_list': app_data['company_layers_list'],
         }
+        PROCESSED_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(PROCESSED_DATA_FILE, 'wb') as f:
             pickle.dump(cache_payload, f)
         print(f"Cached shapefile layers to: {PROCESSED_DATA_FILE}")
