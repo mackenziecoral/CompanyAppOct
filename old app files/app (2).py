@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 import oracledb
 from scipy.optimize import curve_fit
 from shiny.types import FileInfo
@@ -73,27 +73,15 @@ def connect_to_db():
 
     try:
         print(f"Attempting to connect to Oracle: {TNS_ALIAS} as user: {DB_USER}")
-
+        
         # Note: The oracledb.init_oracle_client() might be needed if the Oracle Instant Client
         # is not in your system's PATH or LD_LIBRARY_PATH. For example:
         # oracledb.init_oracle_client(lib_dir="C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/InstantClient_64bit/instantclient_23_7")
-
+        
         engine = create_engine(
             CONNECTION_STRING,
-            echo=False,  # Set to True for debugging SQL queries
-            pool_pre_ping=True,
-            pool_recycle=3600,
+            echo=False  # Set to True for debugging SQL queries
         )
-
-        @event.listens_for(engine, "connect")
-        def _set_call_timeout(dbapi_conn, conn_record):
-            """Apply a per-statement timeout when supported by python-oracledb."""
-            try:
-                dbapi_conn.call_timeout = 30000  # 30 seconds expressed in milliseconds
-            except Exception:
-                # Older client libraries may not expose call_timeout; ignore silently.
-                pass
-
         # Test the connection to confirm it was established.
         with engine.connect() as conn:
             print("SUCCESS: Database connection established.")
@@ -101,9 +89,8 @@ def connect_to_db():
     except Exception as e:
         print(f"ERROR during create_engine or connect call: Failed to connect to Oracle.")
         print(f"Detailed Python error: {e}")
-
-    engine = None
-    return None
+        engine = None
+        return None
 
 # Initial connection attempt when the app starts.
 engine = connect_to_db()
