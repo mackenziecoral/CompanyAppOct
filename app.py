@@ -20,7 +20,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 from sqlalchemy import create_engine, event, text, bindparam
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DatabaseError, SQLAlchemyError
 import oracledb
 from scipy.optimize import curve_fit
 import streamlit as st
@@ -126,7 +126,6 @@ def connect_to_db():
 engine = connect_to_db()
 
 # --- Resilient SQL read helper (handles ORA-08103 by retrying once) ---
-from sqlalchemy.exc import DatabaseError
 
 def read_sql_resilient(sql_text, params=None, max_retries=1):
     """
@@ -793,7 +792,7 @@ def fetch_wells_from_db(
         base_filters = base_filters + "\n  AND " + "\n  AND ".join(optional_clauses)
 
     inner_sql = f"""
-        SELECT DISTINCT
+        SELECT
             W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
             W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
             W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
