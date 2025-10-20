@@ -403,10 +403,10 @@ def load_and_process_all_data():
                W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
                W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
                P.STRAT_UNIT_ID, W.SPUD_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
-        FROM GDC.WELL W
-        LEFT JOIN GDC.PDEN P ON W.GSL_UWI = P.GSL_UWI
-        LEFT JOIN GDC.FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
-        LEFT JOIN GDC.PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
+        FROM WELL W
+        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
+        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
+        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
         WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL
           AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
         """
@@ -435,7 +435,7 @@ def load_and_process_all_data():
                     id_list = ','.join([str(int(x)) for x in batch_ids if str(x).isdigit()])
                     if not id_list:
                         continue
-                    sql_strat_names = f"SELECT STRAT_UNIT_ID, SHORT_NAME FROM GDC.STRAT_UNIT WHERE STRAT_UNIT_ID IN ({id_list})"
+                    sql_strat_names = f"SELECT STRAT_UNIT_ID, SHORT_NAME FROM STRAT_UNIT WHERE STRAT_UNIT_ID IN ({id_list})"
 
                     strat_names_batch_df = read_sql_resilient(sql_strat_names)
                     if not strat_names_batch_df.empty:
@@ -1057,14 +1057,14 @@ def server(input, output, session):
             ui.notification_show("Database connection not available.", type="error")
             return pd.DataFrame()
 
-        sql_query = text(f"""
+        sql_query = text("""
             SELECT GSL_UWI, YEAR, PRODUCT_TYPE, ACTIVITY_TYPE,
                    JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
                    MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME,
                    SEP_VOLUME, OCT_VOLUME, NOV_VOLUME, DEC_VOLUME
-            FROM GDC.PDEN_VOL_BY_MONTH 
+            FROM PDEN_VOL_BY_MONTH
             WHERE GSL_UWI = :uwi
-            AND ACTIVITY_TYPE = 'PRODUCTION' 
+            AND ACTIVITY_TYPE = 'PRODUCTION'
             AND PRODUCT_TYPE IN ('OIL', 'CND', 'GAS')
         """)
 
@@ -1290,7 +1290,7 @@ def server(input, output, session):
                 SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
                        MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME,
                        NOV_VOLUME, DEC_VOLUME
-                FROM GDC.PDEN_VOL_BY_MONTH
+                FROM PDEN_VOL_BY_MONTH
                 WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """)
             try:
@@ -1631,7 +1631,7 @@ def server(input, output, session):
                 SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
                        MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME,
                        NOV_VOLUME, DEC_VOLUME
-                FROM GDC.PDEN_VOL_BY_MONTH
+                FROM PDEN_VOL_BY_MONTH
                 WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """
             )
@@ -2024,11 +2024,11 @@ def server(input, output, session):
         all_prod_data = []
         for i in range(0, len(target_uwis), 300):
             batch_uwis = target_uwis[i:i + 300]
-            sql_prod = text(f"""
-                SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME, 
-                       MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME, 
-                       NOV_VOLUME, DEC_VOLUME 
-                FROM GDC.PDEN_VOL_BY_MONTH 
+            sql_prod = text("""
+                SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
+                       MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME,
+                       NOV_VOLUME, DEC_VOLUME
+                FROM PDEN_VOL_BY_MONTH
                 WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """)
             try:
