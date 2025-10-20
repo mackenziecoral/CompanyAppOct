@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, text, bindparam
 from sqlalchemy.exc import SQLAlchemyError
 import oracledb
 from scipy.optimize import curve_fit
@@ -956,8 +956,8 @@ def compute_filtered_group_metrics(
             FROM PDEN_VOL_BY_MONTH
             WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """
-        )
-        batch_df = read_sql_resilient(sql_prod, params={"uwis": tuple(batch_uwis)})
+        ).bindparams(bindparam("uwis", expanding=True))
+        batch_df = read_sql_resilient(sql_prod, params={"uwis": list(batch_uwis)})
         if not batch_df.empty:
             all_prod_data.append(batch_df)
 
@@ -1214,8 +1214,8 @@ def compute_type_curve_analysis(
             FROM PDEN_VOL_BY_MONTH
             WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """
-        )
-        batch_df = read_sql_resilient(sql_prod, params={"uwis": tuple(batch_uwis)})
+        ).bindparams(bindparam("uwis", expanding=True))
+        batch_df = read_sql_resilient(sql_prod, params={"uwis": list(batch_uwis)})
         if not batch_df.empty:
             all_prod_data.append(batch_df)
 
@@ -1416,8 +1416,8 @@ def compute_operator_group_data(
             FROM PDEN_VOL_BY_MONTH
             WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """
-        )
-        batch_df = read_sql_resilient(sql_prod, params={"uwis": tuple(batch_uwis)})
+        ).bindparams(bindparam("uwis", expanding=True))
+        batch_df = read_sql_resilient(sql_prod, params={"uwis": list(batch_uwis)})
         if not batch_df.empty:
             all_prod_data.append(batch_df)
 
