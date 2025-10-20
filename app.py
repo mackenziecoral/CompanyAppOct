@@ -398,12 +398,31 @@ def load_and_process_all_data():
             if unique_strat_ids:
                 for i in range(0, len(unique_strat_ids), 500):
                     batch_ids = unique_strat_ids[i:i + 500]
-                    id_list = ','.join([str(int(x)) for x in batch_ids if str(x).isdigit()])
-                    if not id_list:
-                        continue
-                    sql_strat_names = f"SELECT STRAT_UNIT_ID, SHORT_NAME FROM STRAT_UNIT WHERE STRAT_UNIT_ID IN ({id_list})"
+                    normalized_ids: list[int] = []
+                    for raw_id in batch_ids:
+                        if pd.isna(raw_id):
+                            continue
+                        try:
+                            normalized_ids.append(int(float(raw_id)))
+                            continue
+                        except (TypeError, ValueError):
+                            pass
 
-                    strat_names_batch_df = read_sql_resilient(sql_strat_names)
+                        digits_only = re.sub(r"[^0-9]", "", str(raw_id))
+                        if digits_only:
+                            try:
+                                normalized_ids.append(int(digits_only))
+                            except ValueError:
+                                continue
+
+                    if not normalized_ids:
+                        continue
+
+                    sql_strat_names = text(
+                        "SELECT STRAT_UNIT_ID, SHORT_NAME FROM STRAT_UNIT WHERE STRAT_UNIT_ID IN :ids"
+                    ).bindparams(bindparam("ids", expanding=True))
+
+                    strat_names_batch_df = read_sql_resilient(sql_strat_names, params={"ids": normalized_ids})
                     if not strat_names_batch_df.empty:
                         strat_names_batch_df = clean_df_colnames(strat_names_batch_df, "Strat Unit Names")
                         strat_names_df = pd.concat([strat_names_df, strat_names_batch_df], ignore_index=True)
@@ -459,6 +478,45 @@ def load_and_process_all_data():
                 'OPERATORNAME_DISPLAY': 'OperatorName'
             }
             wells_master_df = wells_master_df.rename(columns=rename_map)
+
+            if 'OperatorName' in wells_master_df.columns:
+                operator_clean = wells_master_df['OperatorName'].astype(object)
+                operator_clean = operator_clean.where(operator_clean.notna())
+                operator_clean = operator_clean.astype(str).str.strip()
+                operator_clean = operator_clean.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+
+                operator_code_series = wells_master_df.get('OperatorCode')
+                if operator_code_series is not None:
+                    operator_fallback = operator_code_series.astype(object).where(operator_code_series.notna())
+                    operator_fallback = operator_fallback.astype(str).str.strip()
+                    operator_fallback = operator_fallback.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+                    operator_clean = operator_clean.fillna(operator_fallback)
+
+                operator_clean = operator_clean.fillna('Unknown')
+                wells_master_df['OperatorName'] = operator_clean
+
+            if 'Formation' in wells_master_df.columns:
+                formation_clean = wells_master_df['Formation'].astype(object)
+                formation_clean = formation_clean.where(formation_clean.notna())
+                formation_clean = formation_clean.astype(str).str.strip()
+                formation_clean = formation_clean.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+
+                strat_series = wells_master_df.get('StratUnitID')
+                if strat_series is not None:
+                    def _normalize_strat(val):
+                        if pd.isna(val):
+                            return np.nan
+                        try:
+                            return str(int(float(val)))
+                        except (TypeError, ValueError):
+                            cleaned = re.sub(r"[^0-9A-Za-z]", "", str(val)).strip()
+                            return cleaned or np.nan
+
+                    strat_fallback = strat_series.apply(_normalize_strat)
+                    formation_clean = formation_clean.fillna(strat_fallback)
+
+                formation_clean = formation_clean.fillna('Unknown')
+                wells_master_df['Formation'] = formation_clean
 
             for col in final_column_names:
                 if col not in wells_master_df.columns:
