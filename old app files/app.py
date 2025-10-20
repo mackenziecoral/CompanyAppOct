@@ -13,16 +13,10 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 import oracledb
 from scipy.optimize import curve_fit
 from shiny.types import FileInfo
-import sys
-import urllib.parse
-from contextlib import contextmanager
-
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
 
 from shiny import App, ui, render, reactive, session, req
 import htmltools
@@ -48,133 +42,59 @@ from ipyleaflet import (
 )
 
 # --- Database Connection Details ---
-# (REPLACEMENT BLOCK: use python-oracledb in Thick mode with your Instant Client)
-
-import os
-import sys
-from contextlib import contextmanager
-
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.exc import SQLAlchemyError
-import oracledb  # official Oracle driver behind SQLAlchemy's oracle+oracledb
-
-def _log(msg: str):
-    try:
-        import streamlit as st  # type: ignore
-        st.write(msg)
-    except Exception:
-        print(msg, file=sys.stderr)
-
-# ---- HARD SETTINGS (no placeholders)
-DB_USER     = "WOODMAC"
+DB_USER = "WOODMAC"
 DB_PASSWORD = "c0pp3r"
-TNS_ALIAS   = "GDC_LINK.geologic.com"  # must match an alias in tnsnames.ora
+TNS_ALIAS = "GDC_LINK.geologic.com"
 
-# Your exact Instant Client location (as provided)
-INSTANT_CLIENT_DIR = r"C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/InstantClient_64bit/instantclient_23_7"
-
-# Prefer <instantclient>/network/admin if present; else fall back to instantclient dir
-_possible_tns_admin = os.path.join(os.path.dirname(INSTANT_CLIENT_DIR), "network", "admin")
-if os.path.isdir(_possible_tns_admin):
-    TNS_ADMIN_DIR = _possible_tns_admin
-else:
-    TNS_ADMIN_DIR = INSTANT_CLIENT_DIR
-
-# Ensure DLLs and Oracle Net config are discoverable
-os.environ["PATH"] = INSTANT_CLIENT_DIR + os.pathsep + os.environ.get("PATH", "")
-os.environ["TNS_ADMIN"] = TNS_ADMIN_DIR
-
-# Initialize Thick mode explicitly (loads Instant Client + uses TNS_ADMIN)
-try:
-    oracledb.init_oracle_client(lib_dir=INSTANT_CLIENT_DIR, config_dir=TNS_ADMIN_DIR)
-    _log(f"Oracle client initialized. TNS_ADMIN={TNS_ADMIN_DIR}")
-except Exception as e:
-    _log(f"⚠️ init_oracle_client warning: {e} — proceeding; may already be initialized.")
-
-# Build the SQLAlchemy connection string for python-oracledb
+# SQLAlchemy connection string format for Oracle with the python-oracledb driver.
+# The DSN (Data Source Name) is the TNS alias.
 CONNECTION_STRING = f"oracle+oracledb://{DB_USER}:{DB_PASSWORD}@{TNS_ALIAS}"
 
 # Global engine object to hold the database connection pool.
 engine = None
 
+# --- Function to Establish Database Connection ---
 def connect_to_db():
     """
-    Establishes and returns a SQLAlchemy engine object (oracle+oracledb, Thick mode).
+    Establishes and returns a SQLAlchemy engine object.
+    This replaces the R function of the same name.
     """
     global engine
-
-    # If engine exists, test it and return if healthy
+    # If engine exists, test the connection to see if it's still valid.
     if engine is not None:
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1 FROM DUAL"))
-            _log("Database connection is still valid.")
+            print("Database connection is still valid.")
             return engine
         except Exception as e:
-            _log(f"Connection lost, attempting to reconnect. Error: {e}")
+            print(f"Connection lost, attempting to reconnect. Error: {e}")
             engine = None
 
     try:
-        _log(f"Attempting to connect to Oracle: {TNS_ALIAS} as user: {DB_USER}")
-
-        _engine = create_engine(
+        print(f"Attempting to connect to Oracle: {TNS_ALIAS} as user: {DB_USER}")
+        
+        # Note: The oracledb.init_oracle_client() might be needed if the Oracle Instant Client
+        # is not in your system's PATH or LD_LIBRARY_PATH. For example:
+        # oracledb.init_oracle_client(lib_dir="C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/InstantClient_64bit/instantclient_23_7")
+        
+        engine = create_engine(
             CONNECTION_STRING,
-            echo=False,          # Set True to debug SQL
-            pool_pre_ping=True,  # drop stale connections automatically
-            pool_recycle=3600,   # recycle hourly
-            future=True,
+            connect_args={"timeout": 10},
+            echo=False  # Set to True for debugging SQL queries
         )
-
-        # Set a per-statement call timeout (milliseconds) when supported
-        @event.listens_for(_engine, "connect")
-        def _set_call_timeout(dbapi_conn, conn_record):
-            try:
-                dbapi_conn.call_timeout = 30000  # 30s
-            except Exception:
-                pass  # ignore on older client versions
-
-        # Smoke test
-        with _engine.connect() as conn:
-            conn.execute(text("SELECT 1 FROM DUAL"))
-
-        _log("✅ SUCCESS: Database connection established.")
-        engine = _engine
+        # Test the connection to confirm it was established.
+        with engine.connect() as conn:
+            print("SUCCESS: Database connection established.")
         return engine
-
-    except SQLAlchemyError as e:
-        _log("❌ ERROR during create_engine or connect call: Failed to connect to Oracle.")
-        _log(f"Detailed Python error: {e}")
+    except Exception as e:
+        print(f"ERROR during create_engine or connect call: Failed to connect to Oracle.")
+        print(f"Detailed Python error: {e}")
         engine = None
         return None
 
 # Initial connection attempt when the app starts.
 engine = connect_to_db()
-
-# --- Resilient SQL read helper (handles ORA-08103 by retrying once) ---
-from sqlalchemy.exc import DatabaseError
-
-def read_sql_resilient(sql_text, params=None, max_retries=1):
-    """
-    Execute a SELECT and return a DataFrame.
-    Retries once on ORA-08103 by disposing the pool and reconnecting.
-    """
-    attempt = 0
-    while True:
-        try:
-            with engine.connect() as conn:
-                # Accept either plain SQL string or sqlalchemy.text(...)
-                return pd.read_sql(sql_text, conn, params=params)
-        except DatabaseError as e:
-            msg = str(e).upper()
-            if attempt < max_retries and ("ORA-08103" in msg):
-                attempt += 1
-                try:
-                    engine.dispose()
-                except Exception:
-                    pass
-                continue
-            raise
-
 
 # Note on app shutdown: SQLAlchemy's connection pooling is designed to manage
 # connections automatically. Unlike the R Shiny 'onStop', it's not typical
@@ -403,16 +323,15 @@ def load_and_process_all_data():
                W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
                W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
                P.STRAT_UNIT_ID, W.SPUD_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
-        FROM GDC.WELL W
-        LEFT JOIN GDC.PDEN P ON W.GSL_UWI = P.GSL_UWI
-        LEFT JOIN GDC.FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
-        LEFT JOIN GDC.PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
+        FROM WELL W
+        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
+        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
+        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
         WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL
           AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
         """
-
         print("Fetching well master data from Oracle...")
-        wells_master_df = read_sql_resilient(sql_well_master)
+        wells_master_df = pd.read_sql(sql_well_master, engine)
         print(f"DB Load: Successfully loaded {len(wells_master_df)} base well rows from DB.")
 
         if not wells_master_df.empty:
@@ -435,9 +354,8 @@ def load_and_process_all_data():
                     id_list = ','.join([str(int(x)) for x in batch_ids if str(x).isdigit()])
                     if not id_list:
                         continue
-                    sql_strat_names = f"SELECT STRAT_UNIT_ID, SHORT_NAME FROM GDC.STRAT_UNIT WHERE STRAT_UNIT_ID IN ({id_list})"
-
-                    strat_names_batch_df = read_sql_resilient(sql_strat_names)
+                    sql_strat_names = f"SELECT STRAT_UNIT_ID, SHORT_NAME FROM STRAT_UNIT WHERE STRAT_UNIT_ID IN ({id_list})"
+                    strat_names_batch_df = pd.read_sql(sql_strat_names, engine)
                     if not strat_names_batch_df.empty:
                         strat_names_batch_df = clean_df_colnames(strat_names_batch_df, "Strat Unit Names")
                         strat_names_df = pd.concat([strat_names_df, strat_names_batch_df], ignore_index=True)
@@ -1062,14 +980,15 @@ def server(input, output, session):
                    JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
                    MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME,
                    SEP_VOLUME, OCT_VOLUME, NOV_VOLUME, DEC_VOLUME
-            FROM GDC.PDEN_VOL_BY_MONTH 
+            FROM PDEN_VOL_BY_MONTH 
             WHERE GSL_UWI = :uwi
             AND ACTIVITY_TYPE = 'PRODUCTION' 
             AND PRODUCT_TYPE IN ('OIL', 'CND', 'GAS')
         """)
 
         try:
-            well_prod_raw = read_sql_resilient(sql_query, params={"uwi": selected_uwi})
+            with engine.connect() as conn:
+                well_prod_raw = pd.read_sql(sql_query, conn, params={"uwi": selected_uwi})
         except Exception as e:
             ui.notification_show(f"Error fetching production data: {e}", type="error")
             return pd.DataFrame()
@@ -1290,7 +1209,7 @@ def server(input, output, session):
                 SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
                        MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME,
                        NOV_VOLUME, DEC_VOLUME
-                FROM GDC.PDEN_VOL_BY_MONTH
+                FROM PDEN_VOL_BY_MONTH
                 WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """)
             try:
@@ -1631,13 +1550,14 @@ def server(input, output, session):
                 SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
                        MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME,
                        NOV_VOLUME, DEC_VOLUME
-                FROM GDC.PDEN_VOL_BY_MONTH
+                FROM PDEN_VOL_BY_MONTH
                 WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """
             )
             try:
-                batch_df = read_sql_resilient(sql_prod, params={"uwis": tuple(batch_uwis)})
-                all_prod_data.append(batch_df)
+                with engine.connect() as conn:
+                    batch_df = pd.read_sql(sql_prod, conn, params={"uwis": tuple(batch_uwis)})
+                    all_prod_data.append(batch_df)
             except Exception as e:
                 print(f"Error fetching batch prod data for Arps: {e}")
 
@@ -2028,12 +1948,13 @@ def server(input, output, session):
                 SELECT GSL_UWI, YEAR, PRODUCT_TYPE, JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME, 
                        MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME, 
                        NOV_VOLUME, DEC_VOLUME 
-                FROM GDC.PDEN_VOL_BY_MONTH 
+                FROM PDEN_VOL_BY_MONTH 
                 WHERE GSL_UWI IN :uwis AND ACTIVITY_TYPE = 'PRODUCTION'
             """)
             try:
-                batch_df = read_sql_resilient(sql_prod, params={"uwis": tuple(batch_uwis)})
-                all_prod_data.append(batch_df)
+                with engine.connect() as conn:
+                    batch_df = pd.read_sql(sql_prod, conn, params={"uwis": tuple(batch_uwis)})
+                    all_prod_data.append(batch_df)
             except Exception as e:
                 print(f"Error fetching operator group prod data: {e}")
 
