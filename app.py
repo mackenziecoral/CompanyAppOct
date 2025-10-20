@@ -156,9 +156,8 @@ def read_sql_resilient(sql_text, params=None, max_retries=1):
 
 
 # Note on app shutdown: SQLAlchemy's connection pooling is designed to manage
-# connections automatically. Unlike the R Shiny 'onStop', it's not typical
-# in Python web apps to manually close the engine on shutdown. The pool handles
-# stale connections and recycling.
+# connections automatically, so it's not typical in Python web apps to manually
+# close the engine on shutdown. The pool handles stale connections and recycling.
 
 # --- 1. Define File Paths and Constants ---
 # All static assets live next to the app source so the tool can ship with
@@ -2595,7 +2594,6 @@ def _build_well_selector_options(df: pd.DataFrame) -> dict[str, str]:
 def main() -> None:
     st.set_page_config(page_title=STREAMLIT_PAGE_TITLE, layout="wide")
     st.title("Interactive Well and Acreage Map Application")
-    st.markdown("This Streamlit interface mirrors the legacy Shiny workflows using Python.")
 
     _ensure_session_defaults()
     _drain_initial_well_future()
