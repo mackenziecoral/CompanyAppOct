@@ -8,21 +8,19 @@ from datetime import datetime, date
 import pickle
 from itertools import cycle
 import textwrap
+import sys
+import urllib.parse
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import SQLAlchemyError
 import oracledb
 from scipy.optimize import curve_fit
 from shiny.types import FileInfo
-import sys
-import urllib.parse
-from contextlib import contextmanager
-
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
 
 from shiny import App, ui, render, reactive, session, req
 import htmltools
@@ -50,20 +48,8 @@ from ipyleaflet import (
 # --- Database Connection Details ---
 # (REPLACEMENT BLOCK: use python-oracledb in Thick mode with your Instant Client)
 
-import os
-import sys
-from contextlib import contextmanager
-
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.exc import SQLAlchemyError
-import oracledb  # official Oracle driver behind SQLAlchemy's oracle+oracledb
-
 def _log(msg: str):
-    try:
-        import streamlit as st  # type: ignore
-        st.write(msg)
-    except Exception:
-        print(msg, file=sys.stderr)
+    print(msg, file=sys.stderr)
 
 # ---- HARD SETTINGS (no placeholders)
 DB_USER     = "WOODMAC"
@@ -603,7 +589,7 @@ app_ui = ui.page_fluid(
             """
         )
     ),
-    ui.panel_title("Interactive Well and Acreage Map Application (Python Conversion)"),
+    ui.h2("Interactive Well and Acreage Map Application (Python Conversion)"),
     ui.layout_sidebar(
         ui.sidebar(
             ui.h4("Well Selection Criteria"),
