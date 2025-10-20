@@ -226,6 +226,20 @@ def clean_df_colnames(df_input: pd.DataFrame, df_name_for_message: str = "a data
     df.columns = final_names
     return df
 
+
+def normalize_operator_code_series(series: pd.Series | None) -> pd.Series:
+    """Return operator codes in a comparable alphanumeric format."""
+    if series is None or not isinstance(series, pd.Series):
+        return pd.Series(dtype=object)
+
+    normalized = series.astype(object)
+    normalized = normalized.where(~normalized.isna())
+    normalized = normalized.astype(str).str.strip().str.upper()
+    normalized = normalized.str.replace(r"\.0$", "", regex=True)
+    normalized = normalized.str.replace(r"[^0-9A-Z]", "", regex=True)
+    normalized = normalized.replace({"": np.nan, "NAN": np.nan, "NONE": np.nan})
+    return normalized
+
 def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "column") -> list:
     """ Replaces R 'prepare_filter_choices' function for populating dropdowns. """
     if column_series is None or column_series.empty:
@@ -437,9 +451,18 @@ def load_and_process_all_data():
             if not operator_codes_df.empty:
                 operator_codes_df = clean_df_colnames(operator_codes_df, "Operator Codes from Excel")
                 if {'OPERATOR', 'GSL_PARENT_BA_NAME'}.issubset(operator_codes_df.columns):
-                    operator_codes_df = operator_codes_df.rename(columns={'OPERATOR': 'WoodmackJoinOperatorCode', 'GSL_PARENT_BA_NAME': 'OperatorNameDisplay'})
-                    operator_codes_df['WoodmackJoinOperatorCode'] = operator_codes_df['WoodmackJoinOperatorCode'].astype(str)
-                    wells_master_df['OPERATOR_CODE'] = wells_master_df.get('OPERATOR_CODE', '').astype(str)
+                    operator_codes_df = operator_codes_df.rename(
+                        columns={
+                            'OPERATOR': 'WoodmackJoinOperatorCode',
+                            'GSL_PARENT_BA_NAME': 'OperatorNameDisplay'
+                        }
+                    )
+                    operator_codes_df['WoodmackJoinOperatorCode'] = normalize_operator_code_series(
+                        operator_codes_df['WoodmackJoinOperatorCode']
+                    )
+                    wells_master_df['OPERATOR_CODE'] = normalize_operator_code_series(
+                        wells_master_df.get('OPERATOR_CODE')
+                    )
                     wells_master_df = pd.merge(
                         wells_master_df,
                         operator_codes_df[['WoodmackJoinOperatorCode', 'OperatorNameDisplay']],
@@ -475,9 +498,13 @@ def load_and_process_all_data():
                 'UWI_STD': 'UWI_Std',
                 'GSL_UWI_STD': 'GSL_UWI_Std',
                 'FORMATION': 'Formation',
-                'OPERATORNAME_DISPLAY': 'OperatorName'
+                'OPERATORNAME_DISPLAY': 'OperatorName',
+                'OperatorNameDisplay': 'OperatorName'
             }
             wells_master_df = wells_master_df.rename(columns=rename_map)
+
+            if 'WoodmackJoinOperatorCode' in wells_master_df.columns:
+                wells_master_df = wells_master_df.drop(columns=['WoodmackJoinOperatorCode'])
 
             if 'OperatorName' in wells_master_df.columns:
                 operator_clean = wells_master_df['OperatorName'].astype(object)
