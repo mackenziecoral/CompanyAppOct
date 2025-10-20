@@ -170,7 +170,12 @@ COMPANY_SHAPEFILES_DIR = APP_ROOT / "Shapefile"
 # Conversion factors
 E3M3_TO_MCF = 35.3147
 M3_TO_BBL = 6.28981
-AVG_DAYS_PER_MONTH = 30.4375
+AVG_DAYS_PER_MONTH = 30.44
+# --- GOR settings
+MAX_MOP_FOR_GOR = 60           # X-axis horizon for trend chart
+MIN_WELLS_PER_POINT = 5        # min wells per point to plot a curve segment
+GOR_CLIP_MAX = 10000           # guardrail for outliers (mcf/bbl)
+GOR_MAP_WINDOW_MONTHS = 6      # rolling window for map coloring (months)
 MCF_PER_BOE = 6  # Standard conversion for BOE calculations
 
 MAX_WELL_RESULTS = 20000
@@ -1060,6 +1065,43 @@ def _assign_operator_colors(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return df, color_lookup
 
 
+def _continuous_color_scale(value: float, vmin: float, vmax: float) -> list[int]:
+    if pd.isna(value):
+        return [150, 150, 150, 120]
+
+    vmin = float(vmin)
+    vmax = float(vmax)
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+
+    v = max(vmin, min(vmax, float(value)))
+    t = (v - vmin) / (vmax - vmin)
+    r = int(30 + t * (200 - 30))
+    g = int(70 + t * (40 - 70))
+    b = int(200 + t * (30 - 200))
+    return [r, g, b, 180]
+
+
+def build_gor_pydeck_layer(gor_pts: pd.DataFrame, vmin: float = 200, vmax: float = 6000):
+    if gor_pts is None or gor_pts.empty:
+        return None
+
+    pts = gor_pts.copy()
+    pts['color_rgba'] = pts['GOR_for_map'].apply(lambda x: _continuous_color_scale(x, vmin, vmax))
+    color_df = pd.DataFrame(pts['color_rgba'].to_list(), columns=['cr', 'cg', 'cb', 'ca'], index=pts.index)
+    pts = pd.concat([pts, color_df], axis=1)
+
+    return pdk.Layer(
+        "ScatterplotLayer",
+        data=pts,
+        get_position="[SurfaceLongitude, SurfaceLatitude]",
+        get_radius=350,
+        get_fill_color="[cr, cg, cb, ca]",
+        pickable=True,
+        auto_highlight=True,
+    )
+
+
 def build_pydeck_map(
     filtered_df: gpd.GeoDataFrame,
     selected_play_layers: list[str],
@@ -1540,6 +1582,179 @@ def compute_filtered_group_metrics(
     }
 
 
+def _ensure_first_prod_dates_for(filtered_wells: pd.DataFrame) -> pd.DataFrame:
+    df = filtered_wells.copy()
+    if 'FirstProdDate' in df.columns and df['FirstProdDate'].notna().any():
+        return df
+
+    ids = df.get('GSL_UWI_Std', pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+    if not ids:
+        return df
+
+    if engine is None:
+        connect_to_db()
+    if engine is None:
+        return df
+
+    sql = text(
+        """
+        SELECT GSL_UWI, FIRST_PROD_DATE
+        FROM PDEN_FIRST_SUM
+        WHERE GSL_UWI IN :uwis
+        """
+    ).bindparams(bindparam("uwis", expanding=True))
+
+    fps = read_sql_resilient(sql, params={"uwis": ids}) or pd.DataFrame()
+    if fps.empty:
+        return df
+
+    fps = clean_df_colnames(fps, "PDEN_FIRST_SUM")
+    fps['GSL_UWI_Std'] = standardize_uwi(fps.get('GSL_UWI'))
+    fps['FirstProdDate'] = pd.to_datetime(fps.get('FIRST_PROD_DATE'), errors='coerce')
+    return df.merge(fps[['GSL_UWI_Std', 'FirstProdDate']], on='GSL_UWI_Std', how='left')
+
+
+def fetch_gor_long_for_wells(filtered_wells: gpd.GeoDataFrame) -> pd.DataFrame:
+    if filtered_wells is None or filtered_wells.empty:
+        raise ValueError("No wells selected for GOR computation.")
+
+    wells = _ensure_first_prod_dates_for(filtered_wells.copy())
+    id_cols = [
+        'GSL_UWI_Std',
+        'FieldName',
+        'Formation',
+        'OperatorName',
+        'ProvinceState',
+        'SurfaceLatitude',
+        'SurfaceLongitude',
+        'FirstProdDate',
+        'WellName',
+    ]
+    for col in id_cols:
+        if col not in wells.columns:
+            wells[col] = np.nan
+
+    wells['FirstProdDate'] = pd.to_datetime(wells['FirstProdDate'], errors='coerce')
+    target = wells['GSL_UWI_Std'].dropna().astype(str).unique().tolist()
+    if not target:
+        raise ValueError("No valid well identifiers.")
+
+    if engine is None:
+        connect_to_db()
+    if engine is None:
+        raise RuntimeError("Database connection not available.")
+
+    parts: list[pd.DataFrame] = []
+    for i in range(0, len(target), 300):
+        batch = target[i:i + 300]
+        sql = text(
+            """
+            SELECT GSL_UWI, YEAR, PRODUCT_TYPE,
+                   JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
+                   MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME,
+                   SEP_VOLUME, OCT_VOLUME, NOV_VOLUME, DEC_VOLUME
+            FROM PDEN_VOL_BY_MONTH
+            WHERE GSL_UWI IN :uwis
+              AND ACTIVITY_TYPE = 'PRODUCTION'
+              AND PRODUCT_TYPE IN ('OIL','CND','GAS')
+            """
+        ).bindparams(bindparam("uwis", expanding=True))
+        df = read_sql_resilient(sql, params={"uwis": batch})
+        if df is not None and not df.empty:
+            parts.append(df)
+
+    if not parts:
+        raise ValueError("No monthly production rows.")
+
+    df = clean_df_colnames(pd.concat(parts, ignore_index=True), "GOR monthly")
+    df['GSL_UWI_Std'] = standardize_uwi(df.get('GSL_UWI'))
+
+    month_names = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+    mcols = [f"{m}_VOLUME" for m in month_names]
+    long = pd.melt(
+        df,
+        id_vars=['GSL_UWI_Std', 'YEAR', 'PRODUCT_TYPE'],
+        value_vars=mcols,
+        var_name='MONTH_COL',
+        value_name='VOLUME',
+    )
+    long['VOLUME'] = pd.to_numeric(long['VOLUME'], errors='coerce').fillna(0.0)
+    month_map = {name: idx for idx, name in enumerate(month_names, start=1)}
+    long['MONTH_NUM'] = long['MONTH_COL'].str[:3].map(month_map)
+    long['PROD_DATE'] = pd.to_datetime(
+        long['YEAR'].astype(int).astype(str) + '-' + long['MONTH_NUM'].astype(int).astype(str) + '-01'
+    )
+
+    long['OilBBL'] = np.where(long['PRODUCT_TYPE'].isin(['OIL', 'CND']), long['VOLUME'] * M3_TO_BBL, 0.0)
+    long['GasMCF'] = np.where(long['PRODUCT_TYPE'].eq('GAS'), long['VOLUME'] * E3M3_TO_MCF, 0.0)
+
+    wm = long.groupby(['GSL_UWI_Std', 'PROD_DATE'], as_index=False).agg(
+        OilBBL=('OilBBL', 'sum'),
+        GasMCF=('GasMCF', 'sum'),
+    )
+
+    attrs = wells[id_cols].drop_duplicates('GSL_UWI_Std')
+    out = wm.merge(attrs, on='GSL_UWI_Std', how='left')
+    out = out[out['FirstProdDate'].notna()].copy()
+
+    mop = ((out['PROD_DATE'] - out['FirstProdDate']).dt.days / AVG_DAYS_PER_MONTH)
+    out['MonthOnProd'] = np.floor(mop + 0.5)
+    out = out[out['MonthOnProd'].notna()]
+    out['MonthOnProd'] = out['MonthOnProd'].astype(int) + 1
+    out = out[(out['MonthOnProd'] >= 1) & (out['MonthOnProd'] <= MAX_MOP_FOR_GOR)]
+
+    out['GOR_mcf_per_bbl'] = np.where(out['OilBBL'] > 0, out['GasMCF'] / out['OilBBL'], np.nan)
+    out.loc[out['GOR_mcf_per_bbl'] > GOR_CLIP_MAX, 'GOR_mcf_per_bbl'] = np.nan
+    return out
+
+
+def aggregate_gor_trend(gor_long: pd.DataFrame, group_col: str, min_wells: int = MIN_WELLS_PER_POINT) -> pd.DataFrame:
+    if gor_long is None or gor_long.empty:
+        return pd.DataFrame()
+
+    wells_per = gor_long.groupby([group_col, 'MonthOnProd'])['GSL_UWI_Std'].nunique().reset_index(name='WellCount')
+    avg = gor_long.groupby([group_col, 'MonthOnProd'], as_index=False).agg(AvgGOR=('GOR_mcf_per_bbl', 'mean'))
+    out = avg.merge(wells_per, on=[group_col, 'MonthOnProd'], how='left')
+    out = out[out['WellCount'] >= max(1, int(min_wells))]
+    return out.sort_values([group_col, 'MonthOnProd'])
+
+
+def latest_rolling_gor_per_well(gor_long: pd.DataFrame, months: int = GOR_MAP_WINDOW_MONTHS) -> pd.DataFrame:
+    if gor_long is None or gor_long.empty:
+        return pd.DataFrame()
+
+    last = gor_long.groupby('GSL_UWI_Std')['PROD_DATE'].max().reset_index(name='LastProdDate')
+    df = gor_long.merge(last, on='GSL_UWI_Std', how='left')
+    df = df[df['PROD_DATE'] >= (df['LastProdDate'] - pd.DateOffset(months=int(months)))]
+
+    rolled = df.groupby('GSL_UWI_Std', as_index=False).agg(
+        GOR_for_map=('GOR_mcf_per_bbl', 'mean'),
+        SurfaceLatitude=('SurfaceLatitude', 'first'),
+        SurfaceLongitude=('SurfaceLongitude', 'first'),
+        FieldName=('FieldName', 'first'),
+        Formation=('Formation', 'first'),
+        OperatorName=('OperatorName', 'first'),
+        ProvinceState=('ProvinceState', 'first'),
+        WellName=('WellName', 'first'),
+    )
+    rolled = rolled.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude'])
+    return rolled.dropna(subset=['GOR_for_map'])
+
+
+def field_level_gor(gor_long: pd.DataFrame) -> pd.DataFrame:
+    if gor_long is None or gor_long.empty:
+        return pd.DataFrame()
+
+    f = gor_long.dropna(subset=['FieldName']).copy()
+    if f.empty:
+        return pd.DataFrame()
+
+    return f.groupby(['FieldName', 'PROD_DATE'], as_index=False).agg(
+        FieldAvgGOR=('GOR_mcf_per_bbl', 'mean'),
+        Wells=('GSL_UWI_Std', 'nunique'),
+    )
+
+
 def make_filtered_group_plots(metrics: dict, breakout_label: str) -> tuple[go.Figure, go.Figure, go.Figure]:
     empty_fig = go.Figure().update_layout(title="No data available.")
     if not metrics:
@@ -1610,6 +1825,32 @@ def make_filtered_group_plots(metrics: dict, breakout_label: str) -> tuple[go.Fi
         cal_fig = empty_fig
 
     return norm_fig, cum_fig, cal_fig
+
+
+def make_gor_trend_plot(gor_trend_df: pd.DataFrame, group_col: str) -> go.Figure:
+    fig = go.Figure()
+    if gor_trend_df is None or gor_trend_df.empty:
+        fig.update_layout(title="No GOR data for current selection.")
+        return fig
+
+    for key, group_df in gor_trend_df.groupby(group_col):
+        fig.add_trace(
+            go.Scatter(
+                x=group_df['MonthOnProd'],
+                y=group_df['AvgGOR'],
+                mode='lines',
+                name=str(key),
+                hovertemplate="MoP %{x}<br>GOR %{y:.0f} mcf/bbl<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=f"Average GOR (mcf/bbl) vs Month on Production by {group_col}",
+        xaxis_title="Month on Production",
+        yaxis_title="Average GOR (mcf/bbl)",
+        hovermode="x unified",
+    )
+    return fig
 
 
 def prepare_filtered_group_table(metrics: dict, breakout_label: str) -> pd.DataFrame:
@@ -2170,12 +2411,13 @@ def main() -> None:
         st.session_state.company_layer_selection,
     )
 
-    tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator = st.tabs([
+    tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator, tab_gor = st.tabs([
         "Well Map",
         "Production Analysis",
         "Filtered Group Cumulative",
         "Type Curve Analysis",
         "Operator Group",
+        "GOR",
     ])
 
     with tab_map:
@@ -2385,6 +2627,92 @@ def main() -> None:
                 file_name="operator_group_summary.csv",
                 mime="text/csv",
             )
+
+    with tab_gor:
+        st.subheader("GOR Analysis (mcf/bbl)")
+
+        if filtered_wells is None or filtered_wells.empty:
+            st.info("Apply filters first to select wells.")
+        else:
+            group_choices = {
+                "Field": "FieldName",
+                "Formation": "Formation",
+                "Operator": "OperatorName",
+                "Province/State": "ProvinceState",
+            }
+            group_label = st.selectbox("Group curves by", list(group_choices.keys()), index=0)
+            mop_max = st.slider("Max Month on Production", 12, 120, MAX_MOP_FOR_GOR, step=6)
+            min_wells = st.slider("Min wells per MoP point", 1, 30, MIN_WELLS_PER_POINT)
+
+            try:
+                gor_long = fetch_gor_long_for_wells(filtered_wells)
+            except ValueError as exc:
+                st.warning(str(exc))
+                gor_long = pd.DataFrame()
+            except RuntimeError as exc:
+                st.error(str(exc))
+                gor_long = pd.DataFrame()
+            except Exception as exc:
+                st.error(f"Failed to compute GOR data: {exc}")
+                gor_long = pd.DataFrame()
+
+            if gor_long.empty:
+                st.info("No GOR data available for the current selection.")
+            else:
+                gor_long = gor_long[gor_long['MonthOnProd'] <= mop_max].copy()
+                group_col = group_choices[group_label]
+                if group_col in gor_long.columns:
+                    gor_long[group_col] = gor_long[group_col].fillna('Unknown')
+
+                trend = aggregate_gor_trend(gor_long, group_col, min_wells=int(min_wells))
+                _render_plotly_chart(make_gor_trend_plot(trend, group_col))
+
+                st.markdown("---")
+                st.subheader("Map: Well-level GOR (rolling average)")
+                roll_mo = st.slider("Rolling window (months)", 3, 12, GOR_MAP_WINDOW_MONTHS)
+                vmin = st.number_input("Color scale min (mcf/bbl)", value=200, step=50)
+                vmax = st.number_input("Color scale max (mcf/bbl)", value=6000, step=100)
+
+                gor_pts = latest_rolling_gor_per_well(gor_long, months=int(roll_mo))
+                if gor_pts.empty:
+                    st.info("No GOR points to map.")
+                else:
+                    base_deck, _ = build_pydeck_map(
+                        filtered_wells,
+                        st.session_state.play_layer_selection,
+                        st.session_state.company_layer_selection,
+                    )
+                    gor_layer = build_gor_pydeck_layer(gor_pts, vmin=float(vmin), vmax=float(vmax))
+                    if base_deck is not None and gor_layer is not None:
+                        base_deck.layers = list(base_deck.layers) + [gor_layer]
+                        base_deck.tooltip = {
+                            "html": (
+                                "<b>Well:</b> {WellName}<br/>"
+                                "<b>Field:</b> {FieldName}<br/>"
+                                "<b>Formation:</b> {Formation}<br/>"
+                                "<b>GOR:</b> {GOR_for_map} mcf/bbl"
+                            )
+                        }
+                        st.pydeck_chart(base_deck)
+                        st.caption("Point color = rolling-average GOR (mcf/bbl).")
+                    else:
+                        st.info("Unable to render GOR map with current selection.")
+
+                with st.expander("Field-level GOR time series"):
+                    fld = field_level_gor(gor_long)
+                    if fld.empty:
+                        st.info("No field names in selection.")
+                    else:
+                        fld2 = fld.sort_values(['FieldName', 'PROD_DATE']).copy()
+                        fld2['PROD_DATE'] = fld2['PROD_DATE'].dt.strftime('%Y-%m')
+                        fld_display = fld2.round({'FieldAvgGOR': 2})
+                        _render_dataframe(fld_display)
+                        st.download_button(
+                            "Download CSV",
+                            fld2.to_csv(index=False),
+                            "field_gor_timeseries.csv",
+                            "text/csv",
+                        )
 
 
 if __name__ == "__main__":
