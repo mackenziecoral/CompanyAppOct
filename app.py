@@ -181,7 +181,7 @@ MCF_PER_BOE = 6  # Standard conversion for BOE calculations
 # --- Map presentation settings
 MAX_OPERATOR_LEGEND_ENTRIES = 12
 
-MAX_WELL_RESULTS = 20000
+MAX_WELL_RESULTS = 500000
 
 FINAL_WELL_COLUMNS = [
     "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
@@ -762,7 +762,7 @@ def fetch_wells_from_db(
     if formation_ids:
         normalized_formations = [str(fid).strip() for fid in formation_ids if str(fid).strip()]
         if normalized_formations:
-            optional_clauses.append("P.STRAT_UNIT_ID IN :formation_ids")
+            optional_clauses.append("(P.STRAT_UNIT_ID IN :formation_ids OR SU.SHORT_NAME IN :formation_ids)")
             params['formation_ids'] = normalized_formations
 
     if fields:
@@ -782,7 +782,9 @@ def fetch_wells_from_db(
         start_ts = pd.to_datetime(start_date, errors='coerce')
         end_ts = pd.to_datetime(end_date, errors='coerce')
         if pd.notna(start_ts) and pd.notna(end_ts):
-            optional_clauses.append("PFS.FIRST_PROD_DATE BETWEEN :first_prod_start AND :first_prod_end")
+            optional_clauses.append(
+                "COALESCE(PFS.FIRST_PROD_DATE, W.SPUD_DATE) BETWEEN :first_prod_start AND :first_prod_end"
+            )
             params['first_prod_start'] = start_ts
             params['first_prod_end'] = end_ts
 
@@ -805,8 +807,8 @@ def fetch_wells_from_db(
         WHERE {base_filters}
     """
 
-    outer_sql = f"SELECT * FROM ({inner_sql}) WHERE ROWNUM <= :max_rows"
-    params['max_rows'] = MAX_WELL_RESULTS
+    outer_sql = inner_sql
+    params.pop('max_rows', None)
 
     text_obj = text(outer_sql)
     if 'operator_codes' in params:
