@@ -25,6 +25,7 @@ import streamlit as st
 import pydeck as pdk
 import plotly.graph_objects as go
 import plotnine as p9
+from operator_coverage_data import OPERATOR_COVERAGE
 
 # --- Database Connection Details ---
 # (REPLACEMENT BLOCK: use python-oracledb in Thick mode with your Instant Client)
@@ -154,7 +155,6 @@ BASE_PATH = "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac
 # Using .pkl (pickle) is a common Python format for saving data structures like DataFrames
 PROCESSED_DATA_FILE = os.path.join(BASE_PATH, "processed_app_data.pkl")
 
-WOODMACK_COVERAGE_FILE_XLSX = os.path.join(BASE_PATH, "Woodmack.Coverage.2024.xlsx")
 PLAY_SUBPLAY_SHAPEFILE_DIR = os.path.join(BASE_PATH, "SubplayShapefile")
 COMPANY_SHAPEFILES_DIR = os.path.join(BASE_PATH, "Shapefile")
 
@@ -220,22 +220,6 @@ def standardize_uwi(uwi_series: pd.Series) -> pd.Series:
     if not isinstance(uwi_series, pd.Series):
         uwi_series = pd.Series(uwi_series)
     return uwi_series.astype(str).str.replace(r'[^A-Za-z0-9]', '', regex=True).str.upper()
-
-def safe_read_excel(file_path: str, sheet_name: str, file_description: str = None) -> pd.DataFrame:
-    """ Replaces R 'safe_read_excel' function. """
-    if file_description is None:
-        file_description = file_path
-    print(f"Attempting to load Excel sheet: {sheet_name} from {file_description}")
-    if not os.path.exists(file_path):
-        warnings.warn(f"Excel file not found: {file_path} for {file_description}")
-        return pd.DataFrame()
-    try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name)
-        print(f"Successfully loaded Excel sheet: {sheet_name} - Rows: {len(df)}, Cols: {len(df.columns)}")
-        return df
-    except Exception as e:
-        warnings.warn(f"Error loading Excel sheet {sheet_name} from {file_path}: {e}")
-        return pd.DataFrame()
 
 def clean_df_colnames(df_input: pd.DataFrame, df_name_for_message: str = "a dataframe") -> pd.DataFrame:
     """ Replaces R 'clean_df_colnames' function, making column names database/Python friendly. """
@@ -362,78 +346,43 @@ def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -
 
 @lru_cache(maxsize=1)
 def load_operator_coverage_df() -> pd.DataFrame:
-    """Load Wood Mackenzie coverage and return normalized operator name mappings."""
+    """Return Wood Mackenzie operator coverage from the embedded mapping."""
 
-    df = safe_read_excel(
-        WOODMACK_COVERAGE_FILE_XLSX,
-        sheet_name="Operator",
-        file_description="Woodmack Coverage (Operator)",
-    )
-    if df.empty:
+    if not OPERATOR_COVERAGE:
         return pd.DataFrame(columns=["OPERATOR_CODE", "OPERATORNAME_DISPLAY"])
 
-    df = clean_df_colnames(df, "Operator Coverage from Excel")
+    codes = pd.Series(list(OPERATOR_COVERAGE.keys()), dtype=object)
+    names = pd.Series(list(OPERATOR_COVERAGE.values()), dtype=object)
 
-    # The Excel sheet contains two useful identifiers:
-    #   * OPERATOR  (alphanumeric join key e.g., AB0002)
-    #   * OPERATOR_CODE (numeric shorthand e.g., 2028)
-    # Prefer the alphanumeric key when present so dropdowns can map to DB codes.
-    code_candidates = [
-        "OPERATOR",
-        "WOODMACKJOINOPERATORCODE",
-        "OPERATOR_CODE",
-        "OPERATOR_CODE_1",
-    ]
-    code_frames = {}
-    for column in code_candidates:
-        if column in df.columns:
-            code_frames[column] = normalize_operator_code_series(df[column])
-
-    if not code_frames:
-        return pd.DataFrame(columns=["OPERATOR_CODE", "OPERATORNAME_DISPLAY"])
-
-    code_df = pd.DataFrame(code_frames)
-    code_series = code_df.bfill(axis=1).iloc[:, 0]
-
-    display_candidates = [
-        "GSL_PARENT_BA_NAME",
-        "OPERATORNAME_DISPLAY",
-        "SIMPLE_NAME",
-    ]
-    display_frames = {}
-    for column in display_candidates:
-        if column not in df.columns:
-            continue
-        candidate = df[column].astype(object)
-        candidate = candidate.where(candidate.notna())
-        candidate = candidate.astype(str).str.strip()
-        candidate = candidate.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-        display_frames[column] = candidate
-
-    if display_frames:
-        display_df = pd.DataFrame(display_frames)
-        display_series = display_df.bfill(axis=1).iloc[:, 0]
-    else:
-        display_series = pd.Series(dtype=object)
-
-    mapping_df = pd.DataFrame({
-        "OPERATOR_CODE": code_series,
-        "OPERATORNAME_DISPLAY": display_series,
+    normalized_codes = normalize_operator_code_series(codes)
+    display_names = names.where(names.notna(), other="")
+    display_names = display_names.astype(str).str.strip()
+    display_names = display_names.replace({
+        "": np.nan,
+        "nan": np.nan,
+        "NAN": np.nan,
+        "None": np.nan,
+        "NONE": np.nan,
     })
 
-    mapping_df["OPERATOR_CODE"] = normalize_operator_code_series(mapping_df["OPERATOR_CODE"])
-    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].astype(object)
-    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].where(
-        mapping_df["OPERATORNAME_DISPLAY"].notna()
-    )
+    coverage_df = pd.DataFrame({
+        "OPERATOR_CODE": normalized_codes,
+        "OPERATORNAME_DISPLAY": display_names,
+    })
 
-    mapping_df = mapping_df.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-    mapping_df = mapping_df.dropna(subset=["OPERATOR_CODE"])
-    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].fillna(mapping_df["OPERATOR_CODE"])
-    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].astype(str).str.strip()
-    mapping_df = mapping_df.drop_duplicates(subset=["OPERATOR_CODE"])
+    coverage_df = coverage_df.replace({
+        "": np.nan,
+        "nan": np.nan,
+        "NAN": np.nan,
+        "None": np.nan,
+        "NONE": np.nan,
+    })
+    coverage_df = coverage_df.dropna(subset=["OPERATOR_CODE"])
+    coverage_df["OPERATORNAME_DISPLAY"] = coverage_df["OPERATORNAME_DISPLAY"].fillna(coverage_df["OPERATOR_CODE"])
+    coverage_df["OPERATORNAME_DISPLAY"] = coverage_df["OPERATORNAME_DISPLAY"].astype(str).str.strip()
+    coverage_df = coverage_df.drop_duplicates(subset=["OPERATOR_CODE"])
 
-    return mapping_df[["OPERATOR_CODE", "OPERATORNAME_DISPLAY"]]
+    return coverage_df[["OPERATOR_CODE", "OPERATORNAME_DISPLAY"]]
 
 
 def _base_well_filters() -> str:
@@ -1863,8 +1812,13 @@ def compute_operator_group_data(
 
     operator_lookup = get_operator_display_lookup()
     wells_df['OperatorName'] = wells_df.get('OPERATOR_CODE').map(operator_lookup).fillna(wells_df.get('OPERATOR_CODE'))
+    wells_df['OperatorName'] = wells_df['OperatorName'].fillna('Unknown')
 
-    operator_wells = wells_df[['GSL_UWI_STD', 'OperatorName']].dropna()
+    operator_wells = wells_df[['GSL_UWI_STD', 'OperatorName']].copy()
+    operator_wells = operator_wells[operator_wells['GSL_UWI_STD'].notna()]
+    operator_wells['OperatorName'] = operator_wells['OperatorName'].astype(str).str.strip()
+    operator_wells.loc[operator_wells['OperatorName'] == '', 'OperatorName'] = 'Unknown'
+
     target_uwis = operator_wells['GSL_UWI_STD'].dropna().astype(str).unique().tolist()
     if not target_uwis:
         raise ValueError("No wells found for selected operators.")
@@ -1908,7 +1862,7 @@ def compute_operator_group_data(
     prod_long['VOLUME'] = pd.to_numeric(prod_long['VOLUME'], errors='coerce').fillna(0)
 
     prod_long = prod_long[prod_long['PRODUCT_TYPE'].isin([p for p in selected_products if p != 'BOE'])]
-    prod_long = prod_long.merge(operator_wells[['GSL_UWI_Std', 'OperatorName']], left_on='GSL_UWI_STD', right_on='GSL_UWI_Std', how='left')
+    prod_long = prod_long.merge(operator_wells, on='GSL_UWI_STD', how='left')
 
     if date_range:
         start_date, end_date = date_range
