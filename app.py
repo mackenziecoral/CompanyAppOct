@@ -7,6 +7,7 @@ import html
 from datetime import datetime, date, timedelta
 import pickle
 from itertools import cycle
+from functools import lru_cache
 import textwrap
 import sys
 import urllib.parse
@@ -163,6 +164,17 @@ M3_TO_BBL = 6.28981
 AVG_DAYS_PER_MONTH = 30.4375
 MCF_PER_BOE = 6  # Standard conversion for BOE calculations
 
+MAX_WELL_RESULTS = 20000
+
+FINAL_WELL_COLUMNS = [
+    "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
+    "BH_Latitude", "BH_Longitude", "LateralLength",
+    "AbandonmentDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
+    "SpudDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
+    "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
+    "ConfidentialType"
+]
+
 # Custom Color Palette
 CUSTOM_PALETTE = [
   "#53143F", "#F94355", "#058F96", "#F57D01", "#205B2E", "#A8011E",
@@ -317,6 +329,411 @@ def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -
 
     return working
 
+
+@lru_cache(maxsize=1)
+def load_operator_coverage_df() -> pd.DataFrame:
+    df = safe_read_excel(WOODMACK_COVERAGE_FILE_XLSX, sheet_name="Operator", file_description="Woodmack Coverage (Operator)")
+    if df.empty:
+        return pd.DataFrame(columns=['OPERATOR_CODE', 'OPERATORNAME_DISPLAY'])
+
+    df = clean_df_colnames(df, "Operator Coverage from Excel")
+    rename_map = {
+        'OPERATOR': 'OPERATOR_CODE',
+        'GSL_PARENT_BA_NAME': 'OPERATORNAME_DISPLAY'
+    }
+    df = df.rename(columns=rename_map)
+
+    if 'OPERATOR_CODE' not in df.columns:
+        return pd.DataFrame(columns=['OPERATOR_CODE', 'OPERATORNAME_DISPLAY'])
+
+    df['OPERATOR_CODE'] = normalize_operator_code_series(df['OPERATOR_CODE'])
+    if 'OPERATORNAME_DISPLAY' in df.columns:
+        df['OPERATORNAME_DISPLAY'] = df['OPERATORNAME_DISPLAY'].astype(str).str.strip()
+    else:
+        df['OPERATORNAME_DISPLAY'] = np.nan
+
+    df = df.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+    df = df[['OPERATOR_CODE', 'OPERATORNAME_DISPLAY']].dropna()
+    df = df.drop_duplicates(subset=['OPERATOR_CODE'])
+    return df
+
+
+def _base_well_filters() -> str:
+    return (
+        "W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL\n"
+        "  AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))"
+    )
+
+
+@lru_cache(maxsize=1)
+def get_operator_display_lookup() -> dict[str, str]:
+    global engine
+    if engine is None:
+        engine = connect_to_db()
+    if engine is None:
+        return {}
+
+    sql = text(
+        """
+        SELECT DISTINCT W.OPERATOR AS OPERATOR_CODE
+        FROM WELL W
+        WHERE """ + _base_well_filters() + " AND W.OPERATOR IS NOT NULL"
+    )
+
+    try:
+        operators_df = read_sql_resilient(sql)
+    except Exception:
+        return {}
+
+    if operators_df.empty:
+        return {}
+
+    operators_df = clean_df_colnames(operators_df, "Distinct Operator Codes")
+    column = 'OPERATOR_CODE' if 'OPERATOR_CODE' in operators_df.columns else operators_df.columns[0]
+    codes = normalize_operator_code_series(operators_df[column])
+
+    coverage_df = load_operator_coverage_df()
+    coverage_map = dict(zip(coverage_df['OPERATOR_CODE'], coverage_df['OPERATORNAME_DISPLAY'])) if not coverage_df.empty else {}
+
+    lookup: dict[str, str] = {}
+    for code in codes.dropna().unique():
+        display = coverage_map.get(code)
+        lookup[str(code)] = display.strip() if isinstance(display, str) and display.strip() else str(code)
+
+    return lookup
+
+
+@lru_cache(maxsize=1)
+def get_formation_lookup() -> dict[str, str]:
+    global engine
+    if engine is None:
+        engine = connect_to_db()
+    if engine is None:
+        return {}
+
+    sql = text(
+        """
+        SELECT DISTINCT P.STRAT_UNIT_ID, SU.SHORT_NAME
+        FROM WELL W
+        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
+        LEFT JOIN STRAT_UNIT SU ON P.STRAT_UNIT_ID = SU.STRAT_UNIT_ID
+        WHERE """ + _base_well_filters() + " AND P.STRAT_UNIT_ID IS NOT NULL"
+    )
+
+    try:
+        strat_df = read_sql_resilient(sql)
+    except Exception:
+        return {}
+
+    if strat_df.empty:
+        return {}
+
+    strat_df = clean_df_colnames(strat_df, "Distinct Strat Units")
+    lookup: dict[str, str] = {}
+    for _, row in strat_df.iterrows():
+        raw_id = row.get('STRAT_UNIT_ID')
+        if pd.isna(raw_id):
+            continue
+        str_id = str(raw_id).strip()
+        if not str_id:
+            continue
+        short_name = row.get('SHORT_NAME')
+        if isinstance(short_name, str):
+            display = short_name.strip() or str_id
+        else:
+            display = str_id
+        lookup[str_id] = display
+    return lookup
+
+
+@lru_cache(maxsize=1)
+def get_field_options() -> list[str]:
+    global engine
+    if engine is None:
+        engine = connect_to_db()
+    if engine is None:
+        return []
+
+    sql = text(
+        """
+        SELECT DISTINCT FL.FIELD_NAME
+        FROM WELL W
+        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
+        WHERE """ + _base_well_filters() + " AND FL.FIELD_NAME IS NOT NULL"
+    )
+
+    try:
+        fields_df = read_sql_resilient(sql)
+    except Exception:
+        return []
+
+    if fields_df.empty:
+        return []
+
+    fields_df = clean_df_colnames(fields_df, "Distinct Field Names")
+    column = 'FIELD_NAME' if 'FIELD_NAME' in fields_df.columns else fields_df.columns[0]
+    field_series = fields_df[column].astype(str).str.strip()
+    field_series = field_series[field_series != '']
+    return sorted(field_series.unique().tolist())
+
+
+@lru_cache(maxsize=1)
+def get_province_options() -> list[str]:
+    global engine
+    if engine is None:
+        engine = connect_to_db()
+    if engine is None:
+        return []
+
+    sql = text(
+        """
+        SELECT DISTINCT W.PROVINCE_STATE
+        FROM WELL W
+        WHERE """ + _base_well_filters() + " AND W.PROVINCE_STATE IS NOT NULL"
+    )
+
+    try:
+        province_df = read_sql_resilient(sql)
+    except Exception:
+        return []
+
+    if province_df.empty:
+        return []
+
+    province_df = clean_df_colnames(province_df, "Distinct Provinces")
+    column = 'PROVINCE_STATE' if 'PROVINCE_STATE' in province_df.columns else province_df.columns[0]
+    series = province_df[column].astype(str).str.strip()
+    series = series[series != '']
+    return sorted(series.unique().tolist())
+
+
+@lru_cache(maxsize=1)
+def get_first_prod_bounds() -> tuple[date, date] | None:
+    global engine
+    if engine is None:
+        engine = connect_to_db()
+    if engine is None:
+        return None
+
+    sql = text(
+        """
+        SELECT MIN(PFS.FIRST_PROD_DATE) AS MIN_DATE, MAX(PFS.FIRST_PROD_DATE) AS MAX_DATE
+        FROM WELL W
+        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
+        WHERE """ + _base_well_filters()
+    )
+
+    try:
+        bounds_df = read_sql_resilient(sql)
+    except Exception:
+        return None
+
+    if bounds_df.empty:
+        return None
+
+    bounds_df = clean_df_colnames(bounds_df, "First Prod Bounds")
+    min_col = 'MIN_DATE' if 'MIN_DATE' in bounds_df.columns else bounds_df.columns[0]
+    max_col = 'MAX_DATE' if 'MAX_DATE' in bounds_df.columns else bounds_df.columns[-1]
+    min_date = pd.to_datetime(bounds_df[min_col].iloc[0], errors='coerce')
+    max_date = pd.to_datetime(bounds_df[max_col].iloc[0], errors='coerce')
+    if pd.isna(min_date) or pd.isna(max_date):
+        return None
+    return min_date.date(), max_date.date()
+
+
+def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame:
+    empty_gdf = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
+    empty_gdf.attrs['truncated'] = False
+
+    if df is None or df.empty:
+        return empty_gdf
+
+    df = clean_df_colnames(df, "Filtered Wells from DB")
+
+    if 'UWI' in df.columns:
+        df['UWI_STD'] = standardize_uwi(df['UWI'])
+    else:
+        df['UWI_STD'] = np.nan
+
+    if 'GSL_UWI' in df.columns:
+        df['GSL_UWI_STD'] = standardize_uwi(df['GSL_UWI'])
+    else:
+        df['GSL_UWI_STD'] = np.nan
+
+    if 'STRAT_UNIT_ID' in df.columns:
+        df['STRAT_UNIT_ID'] = df['STRAT_UNIT_ID'].astype(object)
+
+    if 'OPERATOR_CODE' in df.columns:
+        df['OPERATOR_CODE'] = normalize_operator_code_series(df['OPERATOR_CODE'])
+
+    coverage_df = load_operator_coverage_df()
+    if not coverage_df.empty and 'OPERATOR_CODE' in df.columns:
+        coverage_map = dict(zip(coverage_df['OPERATOR_CODE'], coverage_df['OPERATORNAME_DISPLAY']))
+        df['OperatorNameDisplay'] = df['OPERATOR_CODE'].map(coverage_map)
+
+    rename_map = {
+        'UWI': 'UWI',
+        'GSL_UWI': 'GSL_UWI',
+        'SURFACE_LATITUDE': 'SurfaceLatitude',
+        'SURFACE_LONGITUDE': 'SurfaceLongitude',
+        'BOTTOM_HOLE_LATITUDE': 'BH_Latitude',
+        'BOTTOM_HOLE_LONGITUDE': 'BH_Longitude',
+        'GSL_FULL_LATERAL_LENGTH': 'LateralLength',
+        'ABANDONMENT_DATE': 'AbandonmentDate',
+        'WELL_NAME': 'WellName',
+        'CURRENT_STATUS': 'CurrentStatus',
+        'OPERATOR_CODE': 'OperatorCode',
+        'STRAT_UNIT_ID': 'StratUnitID',
+        'STRAT_UNIT_NAME': 'Formation',
+        'SPUD_DATE': 'SpudDate',
+        'FIRST_PROD_DATE': 'FirstProdDate',
+        'FINAL_TD': 'FinalTD',
+        'PROVINCE_STATE': 'ProvinceState',
+        'COUNTRY': 'Country',
+        'FIELD_NAME': 'FieldName',
+        'CONFIDENTIAL_TYPE': 'ConfidentialType',
+        'UWI_STD': 'UWI_Std',
+        'GSL_UWI_STD': 'GSL_UWI_Std',
+        'OperatorNameDisplay': 'OperatorName'
+    }
+    df = df.rename(columns=rename_map)
+
+    formation_lookup = get_formation_lookup()
+    if formation_lookup and 'StratUnitID' in df.columns:
+        df['Formation'] = df.get('Formation').fillna(df['StratUnitID'].map(formation_lookup))
+
+    operator_lookup = get_operator_display_lookup()
+    if operator_lookup and 'OperatorCode' in df.columns:
+        df['OperatorName'] = df.get('OperatorName').fillna(df['OperatorCode'].map(operator_lookup))
+
+    df = ensure_operator_and_formation_columns(df)
+
+    if 'GSL_UWI_Std' in df.columns:
+        df = df.drop_duplicates(subset=['GSL_UWI_Std'])
+    elif 'GSL_UWI' in df.columns:
+        df = df.drop_duplicates(subset=['GSL_UWI'])
+
+    for col in FINAL_WELL_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    date_cols = ['AbandonmentDate', 'SpudDate', 'FirstProdDate']
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    numeric_cols = ['SurfaceLatitude', 'SurfaceLongitude', 'BH_Latitude', 'BH_Longitude', 'LateralLength', 'FinalTD']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    valid_df = df.dropna(subset=['SurfaceLongitude', 'SurfaceLatitude'])
+    if valid_df.empty:
+        result = gpd.GeoDataFrame(
+            df[FINAL_WELL_COLUMNS].copy(),
+            geometry=gpd.GeoSeries([None] * len(df), crs="EPSG:4326"),
+            crs="EPSG:4326"
+        )
+        result.attrs['truncated'] = truncated
+        return result
+
+    gdf = gpd.GeoDataFrame(
+        valid_df[FINAL_WELL_COLUMNS],
+        geometry=gpd.points_from_xy(valid_df.SurfaceLongitude, valid_df.SurfaceLatitude),
+        crs="EPSG:4269"
+    ).to_crs("EPSG:4326")
+    gdf.attrs['truncated'] = truncated
+    return gdf
+
+
+def fetch_wells_from_db(
+    operator_codes: list[str] | None,
+    formation_ids: list[str] | None,
+    fields: list[str] | None,
+    provinces: list[str] | None,
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None,
+) -> gpd.GeoDataFrame:
+    global engine
+    if engine is None:
+        engine = connect_to_db()
+    if engine is None:
+        raise RuntimeError("Database connection not available.")
+
+    params: dict[str, object] = {}
+    optional_clauses: list[str] = []
+
+    if operator_codes:
+        codes_series = normalize_operator_code_series(pd.Series(operator_codes))
+        normalized_codes = [code for code in codes_series.dropna().unique().tolist() if str(code).strip()]
+        if normalized_codes:
+            optional_clauses.append("W.OPERATOR IN :operator_codes")
+            params['operator_codes'] = [str(code) for code in normalized_codes]
+
+    if formation_ids:
+        normalized_formations = [str(fid).strip() for fid in formation_ids if str(fid).strip()]
+        if normalized_formations:
+            optional_clauses.append("P.STRAT_UNIT_ID IN :formation_ids")
+            params['formation_ids'] = normalized_formations
+
+    if fields:
+        normalized_fields = [str(f).strip() for f in fields if str(f).strip()]
+        if normalized_fields:
+            optional_clauses.append("FL.FIELD_NAME IN :fields")
+            params['fields'] = normalized_fields
+
+    if provinces:
+        normalized_provinces = [str(p).strip() for p in provinces if str(p).strip()]
+        if normalized_provinces:
+            optional_clauses.append("W.PROVINCE_STATE IN :provinces")
+            params['provinces'] = normalized_provinces
+
+    if date_range and all(date_range):
+        start_date, end_date = date_range
+        start_ts = pd.to_datetime(start_date, errors='coerce')
+        end_ts = pd.to_datetime(end_date, errors='coerce')
+        if pd.notna(start_ts) and pd.notna(end_ts):
+            optional_clauses.append("PFS.FIRST_PROD_DATE BETWEEN :first_prod_start AND :first_prod_end")
+            params['first_prod_start'] = start_ts
+            params['first_prod_end'] = end_ts
+
+    base_filters = _base_well_filters()
+    if optional_clauses:
+        base_filters = base_filters + "\n  AND " + "\n  AND ".join(optional_clauses)
+
+    inner_sql = f"""
+        SELECT DISTINCT
+            W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
+            W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
+            W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
+            P.STRAT_UNIT_ID, SU.SHORT_NAME AS STRAT_UNIT_NAME, W.SPUD_DATE, PFS.FIRST_PROD_DATE,
+            W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
+        FROM WELL W
+        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
+        LEFT JOIN STRAT_UNIT SU ON P.STRAT_UNIT_ID = SU.STRAT_UNIT_ID
+        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
+        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
+        WHERE {base_filters}
+    """
+
+    outer_sql = f"SELECT * FROM ({inner_sql}) WHERE ROWNUM <= :max_rows"
+    params['max_rows'] = MAX_WELL_RESULTS
+
+    text_obj = text(outer_sql)
+    if 'operator_codes' in params:
+        text_obj = text_obj.bindparams(bindparam('operator_codes', expanding=True))
+    if 'formation_ids' in params:
+        text_obj = text_obj.bindparams(bindparam('formation_ids', expanding=True))
+    if 'fields' in params:
+        text_obj = text_obj.bindparams(bindparam('fields', expanding=True))
+    if 'provinces' in params:
+        text_obj = text_obj.bindparams(bindparam('provinces', expanding=True))
+
+    try:
+        wells_df = read_sql_resilient(text_obj, params=params)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch wells: {exc}")
+
+    truncated = len(wells_df) >= MAX_WELL_RESULTS if wells_df is not None else False
+    return _process_well_records(wells_df, truncated)
+
 def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "column") -> list:
     """ Replaces R 'prepare_filter_choices' function for populating dropdowns. """
     if column_series is None or column_series.empty:
@@ -404,214 +821,34 @@ def geometric_mean(x: pd.Series, na_rm: bool = True) -> float:
 # --- 3. Load and Pre-process Data ---
 # This function encapsulates the entire data loading and preprocessing logic from the R script.
 def load_and_process_all_data():
-    
-    # Define final column names and create an empty GeoDataFrame structure
-    final_column_names = [
-        "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
-        "BH_Latitude", "BH_Longitude", "LateralLength",
-        "AbandonmentDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
-        "SpudDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
-        "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
-        "ConfidentialType"
-    ]
-    empty_gdf = gpd.GeoDataFrame(columns=final_column_names, geometry=[], crs=f"EPSG:4326")
+
+    empty_gdf = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
 
     app_data = {
         'wells_gdf': empty_gdf,
         'play_subplay_layers_list': [],
         'company_layers_list': []
     }
-    load_from_db = True
 
-    # Try loading from pre-processed file first
     if os.path.exists(PROCESSED_DATA_FILE):
-        print(f"Attempting to load pre-processed data from: {PROCESSED_DATA_FILE}")
+        print(f"Attempting to load cached layers from: {PROCESSED_DATA_FILE}")
         try:
             with open(PROCESSED_DATA_FILE, 'rb') as f:
                 loaded_data = pickle.load(f)
-
-            wells_ok = ('wells_gdf' in loaded_data and 
-                        isinstance(loaded_data['wells_gdf'], gpd.GeoDataFrame) and 
-                        not loaded_data['wells_gdf'].empty)
-            play_layers_ok = 'play_subplay_layers_list' in loaded_data
-            company_layers_ok = 'company_layers_list' in loaded_data
-            
-            if wells_ok and play_layers_ok and company_layers_ok:
-                app_data = loaded_data
-                app_data['wells_gdf'] = ensure_operator_and_formation_columns(app_data['wells_gdf'])
-                print("SUCCESS: Pre-processed data loaded and validated from .pkl file.")
-                load_from_db = False
-            else:
-                print("WARNING: .pkl file loaded, but data is invalid/incomplete. Will reload from DB.")
-        
+            if isinstance(loaded_data, dict):
+                play_layers = loaded_data.get('play_subplay_layers_list', [])
+                company_layers = loaded_data.get('company_layers_list', [])
+                if isinstance(play_layers, list) and play_layers:
+                    app_data['play_subplay_layers_list'] = play_layers
+                if isinstance(company_layers, list) and company_layers:
+                    app_data['company_layers_list'] = company_layers
+                print("SUCCESS: Loaded shapefile layers from cache.")
         except Exception as e:
-            print(f"ERROR loading .pkl file: {e}. Will reload from DB.")
+            print(f"WARNING: Unable to load cached data ({e}). Will rebuild from source files.")
 
-    if load_from_db:
-        print("INITIATING DATA LOAD FROM DATABASE AND/OR SHAPEFILES...")
-        global engine
-        if engine is None:
-            engine = connect_to_db()
-        
-        if engine is None:
-            raise Exception("FATAL: Database connection failed. Cannot load primary data.")
-
-        sql_well_master = """
-        SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
-               W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
-               W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
-               P.STRAT_UNIT_ID, W.SPUD_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
-        FROM WELL W
-        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
-        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
-        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
-        WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL
-          AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
-        """
-
-        print("Fetching well master data from Oracle...")
-        wells_master_df = read_sql_resilient(sql_well_master)
-        print(f"DB Load: Successfully loaded {len(wells_master_df)} base well rows from DB.")
-
-        if not wells_master_df.empty:
-            wells_master_df = clean_df_colnames(wells_master_df, "Well Master from DB")
-
-            if 'UWI' in wells_master_df.columns:
-                wells_master_df['UWI_STD'] = standardize_uwi(wells_master_df['UWI'])
-            else:
-                wells_master_df['UWI_STD'] = np.nan
-            if 'GSL_UWI' in wells_master_df.columns:
-                wells_master_df['GSL_UWI_STD'] = standardize_uwi(wells_master_df['GSL_UWI'])
-            else:
-                wells_master_df['GSL_UWI_STD'] = np.nan
-
-            unique_strat_ids = wells_master_df.get('STRAT_UNIT_ID', pd.Series(dtype=str)).dropna().unique().tolist()
-            strat_names_df = pd.DataFrame()
-            if unique_strat_ids:
-                for i in range(0, len(unique_strat_ids), 500):
-                    batch_ids = unique_strat_ids[i:i + 500]
-                    normalized_ids: list[int] = []
-                    for raw_id in batch_ids:
-                        if pd.isna(raw_id):
-                            continue
-                        try:
-                            normalized_ids.append(int(float(raw_id)))
-                            continue
-                        except (TypeError, ValueError):
-                            pass
-
-                        digits_only = re.sub(r"[^0-9]", "", str(raw_id))
-                        if digits_only:
-                            try:
-                                normalized_ids.append(int(digits_only))
-                            except ValueError:
-                                continue
-
-                    if not normalized_ids:
-                        continue
-
-                    sql_strat_names = text(
-                        "SELECT STRAT_UNIT_ID, SHORT_NAME FROM STRAT_UNIT WHERE STRAT_UNIT_ID IN :ids"
-                    ).bindparams(bindparam("ids", expanding=True))
-
-                    strat_names_batch_df = read_sql_resilient(sql_strat_names, params={"ids": normalized_ids})
-                    if not strat_names_batch_df.empty:
-                        strat_names_batch_df = clean_df_colnames(strat_names_batch_df, "Strat Unit Names")
-                        strat_names_df = pd.concat([strat_names_df, strat_names_batch_df], ignore_index=True)
-            if not strat_names_df.empty and 'STRAT_UNIT_ID' in strat_names_df.columns:
-                strat_names_df = strat_names_df.drop_duplicates(subset=['STRAT_UNIT_ID'])
-                strat_names_df = strat_names_df.rename(columns={'SHORT_NAME': 'Formation'})
-                wells_master_df = pd.merge(wells_master_df, strat_names_df[['STRAT_UNIT_ID', 'Formation']], on='STRAT_UNIT_ID', how='left')
-            else:
-                wells_master_df['Formation'] = wells_master_df.get('Formation', np.nan)
-
-            operator_codes_df = safe_read_excel(WOODMACK_COVERAGE_FILE_XLSX, sheet_name="Operator")
-            if not operator_codes_df.empty:
-                operator_codes_df = clean_df_colnames(operator_codes_df, "Operator Codes from Excel")
-                if {'OPERATOR', 'GSL_PARENT_BA_NAME'}.issubset(operator_codes_df.columns):
-                    operator_codes_df = operator_codes_df.rename(
-                        columns={
-                            'OPERATOR': 'WoodmackJoinOperatorCode',
-                            'GSL_PARENT_BA_NAME': 'OperatorNameDisplay'
-                        }
-                    )
-                    operator_codes_df['WoodmackJoinOperatorCode'] = normalize_operator_code_series(
-                        operator_codes_df['WoodmackJoinOperatorCode']
-                    )
-                    wells_master_df['OPERATOR_CODE'] = normalize_operator_code_series(
-                        wells_master_df.get('OPERATOR_CODE')
-                    )
-                    wells_master_df = pd.merge(
-                        wells_master_df,
-                        operator_codes_df[['WoodmackJoinOperatorCode', 'OperatorNameDisplay']],
-                        left_on='OPERATOR_CODE',
-                        right_on='WoodmackJoinOperatorCode',
-                        how='left'
-                    )
-                else:
-                    wells_master_df['OperatorNameDisplay'] = np.nan
-            else:
-                wells_master_df['OperatorNameDisplay'] = np.nan
-
-            rename_map = {
-                'UWI': 'UWI',
-                'GSL_UWI': 'GSL_UWI',
-                'SURFACE_LATITUDE': 'SurfaceLatitude',
-                'SURFACE_LONGITUDE': 'SurfaceLongitude',
-                'BOTTOM_HOLE_LATITUDE': 'BH_Latitude',
-                'BOTTOM_HOLE_LONGITUDE': 'BH_Longitude',
-                'GSL_FULL_LATERAL_LENGTH': 'LateralLength',
-                'ABANDONMENT_DATE': 'AbandonmentDate',
-                'WELL_NAME': 'WellName',
-                'CURRENT_STATUS': 'CurrentStatus',
-                'OPERATOR_CODE': 'OperatorCode',
-                'STRAT_UNIT_ID': 'StratUnitID',
-                'SPUD_DATE': 'SpudDate',
-                'FIRST_PROD_DATE': 'FirstProdDate',
-                'FINAL_TD': 'FinalTD',
-                'PROVINCE_STATE': 'ProvinceState',
-                'COUNTRY': 'Country',
-                'FIELD_NAME': 'FieldName',
-                'CONFIDENTIAL_TYPE': 'ConfidentialType',
-                'UWI_STD': 'UWI_Std',
-                'GSL_UWI_STD': 'GSL_UWI_Std',
-                'FORMATION': 'Formation',
-                'OPERATORNAME_DISPLAY': 'OperatorName',
-                'OperatorNameDisplay': 'OperatorName'
-            }
-            wells_master_df = wells_master_df.rename(columns=rename_map)
-
-            if 'WoodmackJoinOperatorCode' in wells_master_df.columns:
-                wells_master_df = wells_master_df.drop(columns=['WoodmackJoinOperatorCode'])
-
-            wells_master_df = ensure_operator_and_formation_columns(wells_master_df)
-
-            for col in final_column_names:
-                if col not in wells_master_df.columns:
-                    wells_master_df[col] = None
-
-            date_cols = ['AbandonmentDate', 'SpudDate', 'FirstProdDate']
-            for col in date_cols:
-                wells_master_df[col] = pd.to_datetime(wells_master_df[col], errors='coerce')
-
-            numeric_cols = ['SurfaceLatitude', 'SurfaceLongitude', 'BH_Latitude', 'BH_Longitude', 'LateralLength', 'FinalTD']
-            for col in numeric_cols:
-                wells_master_df[col] = pd.to_numeric(wells_master_df[col], errors='coerce')
-
-            wells_for_gdf = wells_master_df.dropna(subset=['SurfaceLongitude', 'SurfaceLatitude'])
-            if not wells_for_gdf.empty:
-                app_data['wells_gdf'] = ensure_operator_and_formation_columns(gpd.GeoDataFrame(
-                    wells_for_gdf[final_column_names],
-                    geometry=gpd.points_from_xy(wells_for_gdf.SurfaceLongitude, wells_for_gdf.SurfaceLatitude),
-                    crs="EPSG:4269"
-                ).to_crs("EPSG:4326"))
-
-            if app_data['wells_gdf'].empty:
-                print("DB Load: No valid well geometries after processing.")
-
-        # --- Load Shapefiles ---
+    if not app_data['play_subplay_layers_list']:
         print("--- Loading Play/Subplay Acreage ---")
-        play_layers = []
+        play_layers: list[dict] = []
         if os.path.isdir(PLAY_SUBPLAY_SHAPEFILE_DIR):
             for root_dir, _, files in os.walk(PLAY_SUBPLAY_SHAPEFILE_DIR):
                 for filename in files:
@@ -629,8 +866,9 @@ def load_and_process_all_data():
                             play_layers.append({'name': layer_name, 'data': gdf})
         app_data['play_subplay_layers_list'] = play_layers
 
+    if not app_data['company_layers_list']:
         print("--- Loading DISSOLVED Company Acreage ---")
-        company_layers = []
+        company_layers: list[dict] = []
         if os.path.isdir(COMPANY_SHAPEFILES_DIR):
             for filename in os.listdir(COMPANY_SHAPEFILES_DIR):
                 if filename.lower().endswith('.shp'):
@@ -646,14 +884,17 @@ def load_and_process_all_data():
                         company_layers.append({'name': layer_name, 'data': gdf})
         app_data['company_layers_list'] = company_layers
 
-        # Save processed data to pickle file
-        try:
-            print(f"Saving processed data to: {PROCESSED_DATA_FILE}")
-            with open(PROCESSED_DATA_FILE, 'wb') as f:
-                pickle.dump(app_data, f)
-            print("Processed data saved to .pkl file.")
-        except Exception as e:
-            print(f"Error saving .pkl file: {e}")
+    try:
+        cache_payload = {
+            'wells_gdf': empty_gdf,
+            'play_subplay_layers_list': app_data['play_subplay_layers_list'],
+            'company_layers_list': app_data['company_layers_list'],
+        }
+        with open(PROCESSED_DATA_FILE, 'wb') as f:
+            pickle.dump(cache_payload, f)
+        print(f"Cached shapefile layers to: {PROCESSED_DATA_FILE}")
+    except Exception as e:
+        print(f"Warning: Unable to cache shapefile layers ({e})")
 
     return app_data
 
@@ -678,7 +919,7 @@ if wells_gdf_global is not None and not wells_gdf_global.empty:
         else:
             print(f"  '{col}' column IS NOT present.")
 else:
-    print("  wells_gdf_global is None or empty before server starts.")
+    print("  wells_gdf_global is empty before server starts (wells load on demand).")
 
 
 
@@ -739,33 +980,6 @@ def _assign_operator_colors(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         df['color_r'] = df['color_g'] = df['color_b'] = df['color_a'] = 180
 
     return df, color_lookup
-
-
-def filter_wells_dataframe(
-    base_df: gpd.GeoDataFrame,
-    operators: list[str] | None,
-    formations: list[str] | None,
-    fields: list[str] | None,
-    provinces: list[str] | None,
-    date_range: tuple[date, date] | None,
-) -> gpd.GeoDataFrame:
-    if base_df is None or base_df.empty:
-        return gpd.GeoDataFrame(columns=wells_gdf_global.columns, crs="EPSG:4326")
-
-    df = base_df.copy()
-    if operators:
-        df = df[df['OperatorName'].isin(operators)]
-    if formations:
-        df = df[df['Formation'].isin(formations)]
-    if fields:
-        df = df[df['FieldName'].isin(fields)]
-    if provinces:
-        df = df[df['ProvinceState'].isin(provinces)]
-    if date_range and 'FirstProdDate' in df.columns:
-        start_date, end_date = date_range
-        df = df[df['FirstProdDate'].between(start_date, end_date, inclusive='both')]
-
-    return df
 
 
 def build_pydeck_map(
@@ -1512,24 +1726,49 @@ def prepare_type_curve_table(result: dict) -> pd.DataFrame:
 
 
 def compute_operator_group_data(
-    selected_operators: list[str],
+    selected_operator_codes: list[str],
     selected_products: list[str],
     date_range: tuple[pd.Timestamp, pd.Timestamp] | None,
 ) -> pd.DataFrame:
-    if not selected_operators:
+    if not selected_operator_codes:
         raise ValueError("Please select at least one operator.")
     if not selected_products:
         raise ValueError("Select at least one product type for analysis.")
 
-    operator_wells = wells_gdf_global[wells_gdf_global['OperatorName'].isin(selected_operators)]
-    target_uwis = operator_wells['GSL_UWI_Std'].dropna().astype(str).unique().tolist()
-    if not target_uwis:
-        raise ValueError("No wells found for selected operators.")
+    codes_series = normalize_operator_code_series(pd.Series(selected_operator_codes))
+    operator_codes = [code for code in codes_series.dropna().unique().tolist() if str(code).strip()]
+    if not operator_codes:
+        raise ValueError("Unable to normalize selected operator codes.")
 
     if engine is None:
         connect_to_db()
     if engine is None:
         raise RuntimeError("Database connection not available.")
+
+    operator_sql = text(
+        """
+        SELECT DISTINCT W.GSL_UWI, W.OPERATOR AS OPERATOR_CODE
+        FROM WELL W
+        WHERE """ + _base_well_filters() + " AND W.OPERATOR IN :operator_codes AND W.GSL_UWI IS NOT NULL"
+    ).bindparams(bindparam("operator_codes", expanding=True))
+
+    wells_df = read_sql_resilient(operator_sql, params={"operator_codes": operator_codes})
+    wells_df = clean_df_colnames(wells_df, "Operator Well Mapping")
+    if wells_df.empty:
+        raise ValueError("No wells found for selected operators.")
+
+    if 'GSL_UWI' in wells_df.columns:
+        wells_df['GSL_UWI_STD'] = standardize_uwi(wells_df['GSL_UWI'])
+    if 'OPERATOR_CODE' in wells_df.columns:
+        wells_df['OPERATOR_CODE'] = normalize_operator_code_series(wells_df['OPERATOR_CODE'])
+
+    operator_lookup = get_operator_display_lookup()
+    wells_df['OperatorName'] = wells_df.get('OPERATOR_CODE').map(operator_lookup).fillna(wells_df.get('OPERATOR_CODE'))
+
+    operator_wells = wells_df[['GSL_UWI_STD', 'OperatorName']].dropna()
+    target_uwis = operator_wells['GSL_UWI_STD'].dropna().astype(str).unique().tolist()
+    if not target_uwis:
+        raise ValueError("No wells found for selected operators.")
 
     all_prod_data: list[pd.DataFrame] = []
     for i in range(0, len(target_uwis), 300):
@@ -1640,9 +1879,9 @@ def prepare_operator_group_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _default_first_prod_range() -> tuple[date, date]:
-    if 'FirstProdDate' in wells_gdf_global.columns and wells_gdf_global['FirstProdDate'].notna().any():
-        dates = pd.to_datetime(wells_gdf_global['FirstProdDate'].dropna())
-        return dates.min().date(), dates.max().date()
+    bounds = get_first_prod_bounds()
+    if bounds:
+        return bounds
     today = date.today()
     return today - timedelta(days=3650), today
 
@@ -1653,7 +1892,7 @@ DEFAULT_OPERATOR_RANGE = (date.today() - timedelta(days=365 * 5), date.today())
 
 def _ensure_session_defaults():
     if 'filtered_wells' not in st.session_state:
-        st.session_state.filtered_wells = wells_gdf_global
+        st.session_state.filtered_wells = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
     if 'play_layer_selection' not in st.session_state:
         st.session_state.play_layer_selection = []
     if 'company_layer_selection' not in st.session_state:
@@ -1687,35 +1926,6 @@ def _build_well_selector_options(df: pd.DataFrame) -> dict[str, str]:
     return options
 
 
-def _prepare_multiselect_options(
-    df: pd.DataFrame | gpd.GeoDataFrame,
-    primary_column: str,
-    fallback_columns: tuple[str, ...] = (),
-) -> list[str]:
-    if df is None or df.empty:
-        return []
-
-    def _clean_series(series: pd.Series | None) -> list[str]:
-        if series is None or not isinstance(series, pd.Series):
-            return []
-        cleaned = series.astype(object)
-        cleaned = cleaned.where(cleaned.notna())
-        cleaned = cleaned.astype(str).str.strip()
-        cleaned = cleaned.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
-        cleaned = cleaned.dropna()
-        if cleaned.empty:
-            return []
-        return sorted(cleaned.unique().tolist())
-
-    options = _clean_series(df.get(primary_column))
-    if not options:
-        for col in fallback_columns:
-            options = _clean_series(df.get(col))
-            if options:
-                break
-    return options
-
-
 def main() -> None:
     st.set_page_config(page_title=STREAMLIT_PAGE_TITLE, layout="wide")
     st.title("Interactive Well and Acreage Map Application")
@@ -1726,22 +1936,26 @@ def main() -> None:
     sidebar = st.sidebar
     sidebar.header("Well Selection Criteria")
 
-    operator_options = _prepare_multiselect_options(
-        wells_gdf_global,
-        'OperatorName',
-        fallback_columns=('OperatorCode',)
+    operator_lookup = get_operator_display_lookup()
+    operator_codes_sorted = sorted(operator_lookup.keys(), key=lambda code: operator_lookup[code])
+    operators = sidebar.multiselect(
+        "Operator",
+        operator_codes_sorted,
+        format_func=lambda code: operator_lookup.get(code, code)
     )
-    formation_options = _prepare_multiselect_options(
-        wells_gdf_global,
-        'Formation',
-        fallback_columns=('StratUnitID',)
-    )
-    field_options = _prepare_multiselect_options(wells_gdf_global, 'FieldName')
-    province_options = _prepare_multiselect_options(wells_gdf_global, 'ProvinceState')
 
-    operators = sidebar.multiselect("Operator", operator_options)
-    formations = sidebar.multiselect("Formation", formation_options)
+    formation_lookup = get_formation_lookup()
+    formation_ids_sorted = sorted(formation_lookup.keys(), key=lambda fid: formation_lookup[fid])
+    formations = sidebar.multiselect(
+        "Formation",
+        formation_ids_sorted,
+        format_func=lambda fid: formation_lookup.get(fid, fid)
+    )
+
+    field_options = get_field_options()
     fields = sidebar.multiselect("Field", field_options)
+
+    province_options = get_province_options()
     provinces = sidebar.multiselect("Province/State", province_options)
     date_start, date_end = sidebar.date_input(
         "Filter by First Production Date",
@@ -1761,23 +1975,29 @@ def main() -> None:
     col_apply, col_reset = sidebar.columns(2)
     with col_apply:
         if st.button("Apply Filters", key="apply_filters"):
-            filtered = filter_wells_dataframe(
-                wells_gdf_global,
-                operators,
-                formations,
-                fields,
-                provinces,
-                (pd.to_datetime(date_start), pd.to_datetime(date_end)) if date_start and date_end else None,
-            )
-            st.session_state.filtered_wells = filtered
-            st.session_state.play_layer_selection = play_layers
-            st.session_state.company_layer_selection = company_layers
-            st.session_state.filtered_group_metrics = None
-            st.session_state.filtered_group_breakout = 'OperatorName'
-            st.success(f"Filters applied. {len(filtered):,} wells selected.")
+            try:
+                filtered = fetch_wells_from_db(
+                    operators,
+                    formations,
+                    fields,
+                    provinces,
+                    (pd.to_datetime(date_start), pd.to_datetime(date_end)) if date_start and date_end else None,
+                )
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.filtered_wells = filtered
+                st.session_state.play_layer_selection = play_layers
+                st.session_state.company_layer_selection = company_layers
+                st.session_state.filtered_group_metrics = None
+                st.session_state.filtered_group_breakout = 'OperatorName'
+                st.success(f"Filters applied. {len(filtered):,} wells selected.")
+                if getattr(filtered, 'attrs', {}).get('truncated'):
+                    st.warning(
+                        f"Showing up to {MAX_WELL_RESULTS:,} wells. Narrow filters to load a smaller result set.")
     with col_reset:
         if st.button("Reset Filters", key="reset_filters"):
-            st.session_state.filtered_wells = wells_gdf_global
+            st.session_state.filtered_wells = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
             st.session_state.play_layer_selection = []
             st.session_state.company_layer_selection = []
             st.session_state.filtered_group_metrics = None
@@ -1974,12 +2194,14 @@ def main() -> None:
 
     with tab_operator:
         st.subheader("Operator Group Cumulative")
-        operator_choices = _prepare_multiselect_options(
-            wells_gdf_global,
-            'OperatorName',
-            fallback_columns=('OperatorCode',)
+        operator_lookup_tab = get_operator_display_lookup()
+        operator_codes_tab = sorted(operator_lookup_tab.keys(), key=lambda code: operator_lookup_tab[code])
+        selected_ops = st.multiselect(
+            "Select Operators",
+            operator_codes_tab,
+            format_func=lambda code: operator_lookup_tab.get(code, code),
+            key="operator_group_select"
         )
-        selected_ops = st.multiselect("Select Operators", operator_choices, key="operator_group_select")
         operator_product_labels = st.multiselect(
             "Product Types",
             options=list(product_type_choices.keys()),
