@@ -735,6 +735,62 @@ def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame
     return gdf
 
 
+def _apply_well_filters_in_memory(
+    wells: gpd.GeoDataFrame,
+    operator_codes: list[str],
+    formation_ids: list[str],
+    fields: list[str],
+    provinces: list[str],
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None,
+) -> gpd.GeoDataFrame:
+    if wells is None or wells.empty:
+        return wells
+
+    filtered = wells.copy()
+
+    if operator_codes:
+        op_series = normalize_operator_code_series(
+            filtered.get('OperatorCode', pd.Series(index=filtered.index, dtype=object))
+        )
+        filtered = filtered.loc[op_series.isin(operator_codes)]
+
+    if formation_ids:
+        formation_series = filtered.get('Formation', pd.Series(index=filtered.index, dtype=object))
+        strat_series = filtered.get('StratUnitID', pd.Series(index=filtered.index, dtype=object))
+        formation_upper = formation_series.astype(str).str.strip().str.upper()
+        strat_upper = strat_series.astype(str).str.strip().str.upper()
+        mask = formation_upper.isin(formation_ids) | strat_upper.isin(formation_ids)
+        filtered = filtered.loc[mask]
+
+    if fields:
+        field_series = filtered.get('FieldName', pd.Series(index=filtered.index, dtype=object))
+        mask = field_series.astype(str).str.strip().str.upper().isin([f.upper() for f in fields])
+        filtered = filtered.loc[mask]
+
+    if provinces:
+        province_series = filtered.get('ProvinceState', pd.Series(index=filtered.index, dtype=object))
+        province_series = province_series.astype(str).str.strip().str.upper()
+        mask = province_series.isin(provinces)
+        filtered = filtered.loc[mask]
+
+    if date_range is not None:
+        start_ts, end_ts = date_range
+        if pd.notna(start_ts) and pd.notna(end_ts):
+            prod_dates = filtered.get(
+                'FirstProdDate', pd.Series(index=filtered.index, dtype='datetime64[ns]')
+            )
+            spud_dates = filtered.get(
+                'SpudDate', pd.Series(index=filtered.index, dtype='datetime64[ns]')
+            )
+            prod_dates = pd.to_datetime(prod_dates, errors='coerce')
+            spud_dates = pd.to_datetime(spud_dates, errors='coerce')
+            fallback = prod_dates.where(prod_dates.notna(), spud_dates)
+            mask = fallback.between(start_ts, end_ts, inclusive="both")
+            filtered = filtered.loc[mask]
+
+    return filtered
+
+
 def fetch_wells_from_db(
     operator_codes: list[str] | None,
     formation_ids: list[str] | None,
@@ -748,50 +804,36 @@ def fetch_wells_from_db(
     if engine is None:
         raise RuntimeError("Database connection not available.")
 
-    params: dict[str, object] = {}
-    optional_clauses: list[str] = []
+    normalized_operator_codes: list[str] = []
+    normalized_formations: list[str] = []
+    normalized_fields: list[str] = []
+    normalized_provinces: list[str] = []
+    start_ts: pd.Timestamp | None = None
+    end_ts: pd.Timestamp | None = None
 
     if operator_codes:
         codes_series = normalize_operator_code_series(pd.Series(operator_codes))
-        normalized_codes = [code for code in codes_series.dropna().unique().tolist() if str(code).strip()]
-        if normalized_codes:
-            optional_clauses.append("W.OPERATOR IN :operator_codes")
-            params['operator_codes'] = [str(code) for code in normalized_codes]
+        normalized_operator_codes = [code for code in codes_series.dropna().unique().tolist() if str(code).strip()]
 
     if formation_ids:
         normalized_formations = [str(fid).strip() for fid in formation_ids if str(fid).strip()]
-        if normalized_formations:
-            normalized_formations = [val.upper() for val in normalized_formations]
-            optional_clauses.append("(P.STRAT_UNIT_ID IN :formation_ids OR UPPER(SU.SHORT_NAME) IN :formation_ids)")
-            params['formation_ids'] = normalized_formations
+        normalized_formations = [val.upper() for val in normalized_formations]
 
     if fields:
         normalized_fields = [str(f).strip() for f in fields if str(f).strip()]
-        if normalized_fields:
-            optional_clauses.append("FL.FIELD_NAME IN :fields")
-            params['fields'] = normalized_fields
 
     if provinces:
         normalized_provinces = [str(p).strip() for p in provinces if str(p).strip()]
-        if normalized_provinces:
-            normalized_provinces = [val.upper() for val in normalized_provinces]
-            optional_clauses.append("UPPER(W.PROVINCE_STATE) IN :provinces")
-            params['provinces'] = normalized_provinces
+        normalized_provinces = [val.upper() for val in normalized_provinces]
 
     if date_range and all(date_range):
         start_date, end_date = date_range
         start_ts = pd.to_datetime(start_date, errors='coerce')
         end_ts = pd.to_datetime(end_date, errors='coerce')
-        if pd.notna(start_ts) and pd.notna(end_ts):
-            optional_clauses.append(
-                "COALESCE(PFS.FIRST_PROD_DATE, W.SPUD_DATE) BETWEEN :first_prod_start AND :first_prod_end"
-            )
-            params['first_prod_start'] = start_ts
-            params['first_prod_end'] = end_ts
+        if pd.isna(start_ts) or pd.isna(end_ts):
+            start_ts = end_ts = None
 
     base_filters = _base_well_filters()
-    if optional_clauses:
-        base_filters = base_filters + "\n  AND " + "\n  AND ".join(optional_clauses)
 
     inner_sql = f"""
         SELECT
@@ -809,25 +851,26 @@ def fetch_wells_from_db(
     """
 
     outer_sql = inner_sql
-    params.pop('max_rows', None)
-
     text_obj = text(outer_sql)
-    if 'operator_codes' in params:
-        text_obj = text_obj.bindparams(bindparam('operator_codes', expanding=True))
-    if 'formation_ids' in params:
-        text_obj = text_obj.bindparams(bindparam('formation_ids', expanding=True))
-    if 'fields' in params:
-        text_obj = text_obj.bindparams(bindparam('fields', expanding=True))
-    if 'provinces' in params:
-        text_obj = text_obj.bindparams(bindparam('provinces', expanding=True))
 
     try:
-        wells_df = read_sql_resilient(text_obj, params=params)
+        wells_df = read_sql_resilient(text_obj)
     except Exception as exc:
         raise RuntimeError(f"Failed to fetch wells: {exc}")
 
-    truncated = len(wells_df) >= MAX_WELL_RESULTS if wells_df is not None else False
-    return _process_well_records(wells_df, truncated)
+    truncated = False
+    processed = _process_well_records(wells_df, truncated)
+    filtered = _apply_well_filters_in_memory(
+        processed,
+        normalized_operator_codes,
+        normalized_formations,
+        normalized_fields,
+        normalized_provinces,
+        (start_ts, end_ts) if start_ts is not None and end_ts is not None else None,
+    )
+    if processed is not None and hasattr(processed, "attrs") and filtered is not None:
+        filtered.attrs['truncated'] = processed.attrs.get('truncated', False)
+    return filtered
 
 def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "column") -> list:
     """ Replaces R 'prepare_filter_choices' function for populating dropdowns. """
