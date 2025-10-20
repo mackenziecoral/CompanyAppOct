@@ -761,7 +761,8 @@ def fetch_wells_from_db(
     if formation_ids:
         normalized_formations = [str(fid).strip() for fid in formation_ids if str(fid).strip()]
         if normalized_formations:
-            optional_clauses.append("(P.STRAT_UNIT_ID IN :formation_ids OR SU.SHORT_NAME IN :formation_ids)")
+            normalized_formations = [val.upper() for val in normalized_formations]
+            optional_clauses.append("(P.STRAT_UNIT_ID IN :formation_ids OR UPPER(SU.SHORT_NAME) IN :formation_ids)")
             params['formation_ids'] = normalized_formations
 
     if fields:
@@ -773,7 +774,8 @@ def fetch_wells_from_db(
     if provinces:
         normalized_provinces = [str(p).strip() for p in provinces if str(p).strip()]
         if normalized_provinces:
-            optional_clauses.append("W.PROVINCE_STATE IN :provinces")
+            normalized_provinces = [val.upper() for val in normalized_provinces]
+            optional_clauses.append("UPPER(W.PROVINCE_STATE) IN :provinces")
             params['provinces'] = normalized_provinces
 
     if date_range and all(date_range):
