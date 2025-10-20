@@ -240,6 +240,83 @@ def normalize_operator_code_series(series: pd.Series | None) -> pd.Series:
     normalized = normalized.replace({"": np.nan, "NAN": np.nan, "NONE": np.nan})
     return normalized
 
+
+def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -> pd.DataFrame | gpd.GeoDataFrame:
+    """Guarantee OperatorName and Formation columns have usable values."""
+
+    if df is None or len(df) == 0:
+        return df
+
+    working = df.copy()
+
+    # --- Operator cleanup ---
+    if 'OperatorName' not in working.columns:
+        working['OperatorName'] = np.nan
+
+    operator_clean = working['OperatorName'].astype(object)
+    operator_clean = operator_clean.where(operator_clean.notna())
+    operator_clean = operator_clean.astype(str).str.strip()
+    operator_clean = operator_clean.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+
+    fallback_operator_columns = [
+        'OperatorNameDisplay', 'OPERATORNAME_DISPLAY',
+        'Operator', 'OPERATOR',
+        'OperatorCode', 'OPERATOR_CODE'
+    ]
+
+    for col in fallback_operator_columns:
+        if col not in working.columns:
+            continue
+        series = working[col]
+        if col in {'OperatorCode', 'OPERATOR_CODE'}:
+            series = normalize_operator_code_series(series)
+        else:
+            series = series.astype(object)
+            series = series.where(series.notna())
+            series = series.astype(str).str.strip()
+            series = series.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+        operator_clean = operator_clean.fillna(series)
+
+    operator_clean = operator_clean.fillna('Unknown')
+    working['OperatorName'] = operator_clean
+
+    # --- Formation cleanup ---
+    if 'Formation' not in working.columns:
+        working['Formation'] = np.nan
+
+    formation_clean = working['Formation'].astype(object)
+    formation_clean = formation_clean.where(formation_clean.notna())
+    formation_clean = formation_clean.astype(str).str.strip()
+    formation_clean = formation_clean.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+
+    def _normalize_strat_value(val):
+        if pd.isna(val):
+            return np.nan
+        try:
+            return str(int(float(val)))
+        except (TypeError, ValueError):
+            cleaned = re.sub(r"[^0-9A-Za-z]", "", str(val)).strip()
+            return cleaned or np.nan
+
+    strat_fallback_columns = ['Formation', 'STRAT_UNIT_NAME', 'StratUnitName', 'StratUnitID', 'STRAT_UNIT_ID']
+    for col in strat_fallback_columns:
+        if col not in working.columns:
+            continue
+        series = working[col]
+        if col != 'Formation':
+            series = series.apply(_normalize_strat_value)
+        else:
+            series = series.astype(object)
+            series = series.where(series.notna())
+            series = series.astype(str).str.strip()
+            series = series.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+        formation_clean = formation_clean.fillna(series)
+
+    formation_clean = formation_clean.fillna('Unknown')
+    working['Formation'] = formation_clean
+
+    return working
+
 def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "column") -> list:
     """ Replaces R 'prepare_filter_choices' function for populating dropdowns. """
     if column_series is None or column_series.empty:
@@ -361,6 +438,7 @@ def load_and_process_all_data():
             
             if wells_ok and play_layers_ok and company_layers_ok:
                 app_data = loaded_data
+                app_data['wells_gdf'] = ensure_operator_and_formation_columns(app_data['wells_gdf'])
                 print("SUCCESS: Pre-processed data loaded and validated from .pkl file.")
                 load_from_db = False
             else:
@@ -506,44 +584,7 @@ def load_and_process_all_data():
             if 'WoodmackJoinOperatorCode' in wells_master_df.columns:
                 wells_master_df = wells_master_df.drop(columns=['WoodmackJoinOperatorCode'])
 
-            if 'OperatorName' in wells_master_df.columns:
-                operator_clean = wells_master_df['OperatorName'].astype(object)
-                operator_clean = operator_clean.where(operator_clean.notna())
-                operator_clean = operator_clean.astype(str).str.strip()
-                operator_clean = operator_clean.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
-
-                operator_code_series = wells_master_df.get('OperatorCode')
-                if operator_code_series is not None:
-                    operator_fallback = operator_code_series.astype(object).where(operator_code_series.notna())
-                    operator_fallback = operator_fallback.astype(str).str.strip()
-                    operator_fallback = operator_fallback.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
-                    operator_clean = operator_clean.fillna(operator_fallback)
-
-                operator_clean = operator_clean.fillna('Unknown')
-                wells_master_df['OperatorName'] = operator_clean
-
-            if 'Formation' in wells_master_df.columns:
-                formation_clean = wells_master_df['Formation'].astype(object)
-                formation_clean = formation_clean.where(formation_clean.notna())
-                formation_clean = formation_clean.astype(str).str.strip()
-                formation_clean = formation_clean.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
-
-                strat_series = wells_master_df.get('StratUnitID')
-                if strat_series is not None:
-                    def _normalize_strat(val):
-                        if pd.isna(val):
-                            return np.nan
-                        try:
-                            return str(int(float(val)))
-                        except (TypeError, ValueError):
-                            cleaned = re.sub(r"[^0-9A-Za-z]", "", str(val)).strip()
-                            return cleaned or np.nan
-
-                    strat_fallback = strat_series.apply(_normalize_strat)
-                    formation_clean = formation_clean.fillna(strat_fallback)
-
-                formation_clean = formation_clean.fillna('Unknown')
-                wells_master_df['Formation'] = formation_clean
+            wells_master_df = ensure_operator_and_formation_columns(wells_master_df)
 
             for col in final_column_names:
                 if col not in wells_master_df.columns:
@@ -559,11 +600,11 @@ def load_and_process_all_data():
 
             wells_for_gdf = wells_master_df.dropna(subset=['SurfaceLongitude', 'SurfaceLatitude'])
             if not wells_for_gdf.empty:
-                app_data['wells_gdf'] = gpd.GeoDataFrame(
+                app_data['wells_gdf'] = ensure_operator_and_formation_columns(gpd.GeoDataFrame(
                     wells_for_gdf[final_column_names],
                     geometry=gpd.points_from_xy(wells_for_gdf.SurfaceLongitude, wells_for_gdf.SurfaceLatitude),
                     crs="EPSG:4269"
-                ).to_crs("EPSG:4326")
+                ).to_crs("EPSG:4326"))
 
             if app_data['wells_gdf'].empty:
                 print("DB Load: No valid well geometries after processing.")
@@ -618,7 +659,7 @@ def load_and_process_all_data():
 
 # --- Load data into global variables for the app ---
 APP_DATA = load_and_process_all_data()
-wells_gdf_global = APP_DATA['wells_gdf']
+wells_gdf_global = ensure_operator_and_formation_columns(APP_DATA['wells_gdf'])
 play_subplay_layers_list_global = APP_DATA['play_subplay_layers_list']
 company_layers_list_global = APP_DATA['company_layers_list']
 
@@ -631,7 +672,7 @@ initial_company_layer_names = sorted([layer['name'] for layer in company_layers_
 print("--- FINAL CHECK OF wells_gdf_global BEFORE STREAMLIT ---")
 if wells_gdf_global is not None and not wells_gdf_global.empty:
     print(f"  nrow(wells_gdf_global): {len(wells_gdf_global)}")
-    for col in ['ConfidentialType', 'BH_Latitude', 'BH_Longitude', 'LateralLength', 'FirstProdDate']:
+    for col in ['ConfidentialType', 'BH_Latitude', 'BH_Longitude', 'LateralLength', 'FirstProdDate', 'OperatorName', 'Formation']:
         if col in wells_gdf_global.columns:
             print(f"  '{col}' column IS present. Sample: {wells_gdf_global[col].dropna().head(3).to_list()}")
         else:
@@ -1646,6 +1687,35 @@ def _build_well_selector_options(df: pd.DataFrame) -> dict[str, str]:
     return options
 
 
+def _prepare_multiselect_options(
+    df: pd.DataFrame | gpd.GeoDataFrame,
+    primary_column: str,
+    fallback_columns: tuple[str, ...] = (),
+) -> list[str]:
+    if df is None or df.empty:
+        return []
+
+    def _clean_series(series: pd.Series | None) -> list[str]:
+        if series is None or not isinstance(series, pd.Series):
+            return []
+        cleaned = series.astype(object)
+        cleaned = cleaned.where(cleaned.notna())
+        cleaned = cleaned.astype(str).str.strip()
+        cleaned = cleaned.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+        cleaned = cleaned.dropna()
+        if cleaned.empty:
+            return []
+        return sorted(cleaned.unique().tolist())
+
+    options = _clean_series(df.get(primary_column))
+    if not options:
+        for col in fallback_columns:
+            options = _clean_series(df.get(col))
+            if options:
+                break
+    return options
+
+
 def main() -> None:
     st.set_page_config(page_title=STREAMLIT_PAGE_TITLE, layout="wide")
     st.title("Interactive Well and Acreage Map Application")
@@ -1656,10 +1726,23 @@ def main() -> None:
     sidebar = st.sidebar
     sidebar.header("Well Selection Criteria")
 
-    operators = sidebar.multiselect("Operator", sorted(wells_gdf_global['OperatorName'].dropna().unique().tolist()))
-    formations = sidebar.multiselect("Formation", sorted(wells_gdf_global['Formation'].dropna().unique().tolist()))
-    fields = sidebar.multiselect("Field", sorted(wells_gdf_global['FieldName'].dropna().unique().tolist()))
-    provinces = sidebar.multiselect("Province/State", sorted(wells_gdf_global['ProvinceState'].dropna().unique().tolist()))
+    operator_options = _prepare_multiselect_options(
+        wells_gdf_global,
+        'OperatorName',
+        fallback_columns=('OperatorCode',)
+    )
+    formation_options = _prepare_multiselect_options(
+        wells_gdf_global,
+        'Formation',
+        fallback_columns=('StratUnitID',)
+    )
+    field_options = _prepare_multiselect_options(wells_gdf_global, 'FieldName')
+    province_options = _prepare_multiselect_options(wells_gdf_global, 'ProvinceState')
+
+    operators = sidebar.multiselect("Operator", operator_options)
+    formations = sidebar.multiselect("Formation", formation_options)
+    fields = sidebar.multiselect("Field", field_options)
+    provinces = sidebar.multiselect("Province/State", province_options)
     date_start, date_end = sidebar.date_input(
         "Filter by First Production Date",
         value=DEFAULT_FIRST_PROD_RANGE,
@@ -1891,7 +1974,11 @@ def main() -> None:
 
     with tab_operator:
         st.subheader("Operator Group Cumulative")
-        operator_choices = sorted(wells_gdf_global['OperatorName'].dropna().unique().tolist())
+        operator_choices = _prepare_multiselect_options(
+            wells_gdf_global,
+            'OperatorName',
+            fallback_columns=('OperatorCode',)
+        )
         selected_ops = st.multiselect("Select Operators", operator_choices, key="operator_group_select")
         operator_product_labels = st.multiselect(
             "Product Types",
