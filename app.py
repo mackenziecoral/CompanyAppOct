@@ -178,6 +178,9 @@ GOR_CLIP_MAX = 10000           # guardrail for outliers (mcf/bbl)
 GOR_MAP_WINDOW_MONTHS = 6      # rolling window for map coloring (months)
 MCF_PER_BOE = 6  # Standard conversion for BOE calculations
 
+# --- Map presentation settings
+MAX_OPERATOR_LEGEND_ENTRIES = 12
+
 MAX_WELL_RESULTS = 20000
 
 FINAL_WELL_COLUMNS = [
@@ -603,6 +606,36 @@ def get_first_prod_bounds() -> tuple[date, date] | None:
     return min_date.date(), max_date.date()
 
 
+def _drop_duplicate_wells(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicate well rows without collapsing records that lack an identifier."""
+
+    if df is None or df.empty:
+        return df
+
+    work_df = df.copy()
+
+    gsl_std_col = next((col for col in ['GSL_UWI_Std', 'GSL_UWI_STD'] if col in work_df.columns), None)
+    if gsl_std_col:
+        non_null = work_df[gsl_std_col].notna()
+        dedup_non_null = work_df.loc[non_null].drop_duplicates(subset=[gsl_std_col])
+
+        dedup_null = work_df.loc[~non_null]
+        if not dedup_null.empty:
+            uwi_std_col = next((col for col in ['UWI_Std', 'UWI_STD'] if col in dedup_null.columns), None)
+            if uwi_std_col:
+                dedup_null = dedup_null.drop_duplicates(subset=[uwi_std_col])
+            elif 'UWI' in dedup_null.columns:
+                dedup_null = dedup_null.drop_duplicates(subset=['UWI'])
+            elif 'GSL_UWI' in dedup_null.columns:
+                dedup_null = dedup_null.drop_duplicates(subset=['GSL_UWI'])
+
+        work_df = pd.concat([dedup_non_null, dedup_null], ignore_index=True)
+    elif 'GSL_UWI' in work_df.columns:
+        work_df = work_df.drop_duplicates(subset=['GSL_UWI'])
+
+    return work_df
+
+
 def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame:
     empty_gdf = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
     empty_gdf.attrs['truncated'] = False
@@ -670,10 +703,7 @@ def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame
 
     df = ensure_operator_and_formation_columns(df)
 
-    if 'GSL_UWI_Std' in df.columns:
-        df = df.drop_duplicates(subset=['GSL_UWI_Std'])
-    elif 'GSL_UWI' in df.columns:
-        df = df.drop_duplicates(subset=['GSL_UWI'])
+    df = _drop_duplicate_wells(df)
 
     for col in FINAL_WELL_COLUMNS:
         if col not in df.columns:
@@ -1106,36 +1136,26 @@ def build_pydeck_map(
     filtered_df: gpd.GeoDataFrame,
     selected_play_layers: list[str],
     selected_company_layers: list[str],
-) -> tuple[pdk.Deck | None, list[tuple[str, str]]]:
+    *,
+    include_well_layer: bool = True,
+) -> tuple[pdk.Deck | None, dict[str, list[tuple[str, str]]]]:
     layers: list[pdk.Layer] = []
-    legend_entries: list[tuple[str, str]] = []
+    legend_entries: dict[str, list[tuple[str, str]]] = {
+        "Operators": [],
+        "Play/Subplay Boundaries": [],
+        "Company Acreage": [],
+    }
 
     view_state = pdk.ViewState(latitude=55.0, longitude=-106.0, zoom=3.5, pitch=0)
+    tooltip_html = None
+    color_lookup: dict[str, str] = {}
+    operator_counts: pd.Series | None = None
+    map_df = pd.DataFrame()
 
     if filtered_df is not None and not filtered_df.empty:
         map_df = filtered_df.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude']).copy()
         if not map_df.empty:
             map_df, color_lookup = _assign_operator_colors(map_df)
-            if 'FirstProdDate' in map_df.columns:
-                map_df['FirstProdDate'] = map_df['FirstProdDate'].dt.strftime('%Y-%m-%d')
-            tooltip_html = (
-                "<b>Well:</b> {WellName}<br/>"
-                "<b>Operator:</b> {OperatorName}<br/>"
-                "<b>Field:</b> {FieldName}<br/>"
-                "<b>Status:</b> {CurrentStatus}<br/>"
-                "<b>First Prod:</b> {FirstProdDate}"
-            )
-            layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=map_df,
-                    get_position="[SurfaceLongitude, SurfaceLatitude]",
-                    get_radius=350,
-                    get_fill_color="[color_r, color_g, color_b, color_a]",
-                    pickable=True,
-                    auto_highlight=True,
-                )
-            )
             if not map_df[['SurfaceLatitude', 'SurfaceLongitude']].isna().all().all():
                 view_state = pdk.ViewState(
                     latitude=float(map_df['SurfaceLatitude'].mean()),
@@ -1143,10 +1163,35 @@ def build_pydeck_map(
                     zoom=4,
                     pitch=0,
                 )
-        else:
-            tooltip_html = None
-    else:
-        tooltip_html = None
+
+            if include_well_layer:
+                if 'FirstProdDate' in map_df.columns:
+                    map_df['FirstProdDate'] = map_df['FirstProdDate'].dt.strftime('%Y-%m-%d')
+                tooltip_html = (
+                    "<b>Well:</b> {WellName}<br/>"
+                    "<b>Operator:</b> {OperatorName}<br/>"
+                    "<b>Field:</b> {FieldName}<br/>"
+                    "<b>Status:</b> {CurrentStatus}<br/>"
+                    "<b>First Prod:</b> {FirstProdDate}"
+                )
+                layers.append(
+                    pdk.Layer(
+                        "ScatterplotLayer",
+                        data=map_df,
+                        get_position="[SurfaceLongitude, SurfaceLatitude]",
+                        get_radius=350,
+                        get_fill_color="[color_r, color_g, color_b, color_a]",
+                        pickable=True,
+                        auto_highlight=True,
+                    )
+                )
+                if 'OperatorName' in map_df.columns:
+                    operator_counts = (
+                        map_df['OperatorName']
+                        .fillna('Unknown')
+                        .value_counts()
+                        .sort_values(ascending=False)
+                    )
 
     poly_color_cycle = cycle(CUSTOM_PALETTE)
     for layer_info in play_subplay_layers_list_global:
@@ -1169,7 +1214,9 @@ def build_pydeck_map(
                         pickable=False,
                     )
                 )
-                legend_entries.append((f"Play/Subplay: {layer_info['name']}", hex_color))
+                legend_entries["Play/Subplay Boundaries"].append(
+                    (f"{layer_info['name']}", hex_color)
+                )
 
     company_color_cycle = cycle(reversed(CUSTOM_PALETTE))
     for layer_info in company_layers_list_global:
@@ -1192,9 +1239,22 @@ def build_pydeck_map(
                         pickable=False,
                     )
                 )
-                legend_entries.append((f"Company Acreage: {layer_info['name']}", hex_color))
+                legend_entries["Company Acreage"].append(
+                    (f"{layer_info['name']}", hex_color)
+                )
 
-    if not layers:
+    if include_well_layer and operator_counts is not None and not operator_counts.empty:
+        for operator, count in operator_counts.head(MAX_OPERATOR_LEGEND_ENTRIES).items():
+            hex_color = color_lookup.get(operator, "#666666")
+            legend_entries["Operators"].append((f"{operator} ({count})", hex_color))
+
+        if len(operator_counts) > MAX_OPERATOR_LEGEND_ENTRIES:
+            extra = len(operator_counts) - MAX_OPERATOR_LEGEND_ENTRIES
+            legend_entries["Operators"].append((f"+{extra} more", "#b3b3b3"))
+
+    legend_entries = {key: value for key, value in legend_entries.items() if value}
+
+    if not layers and (map_df is None or map_df.empty) and not legend_entries:
         return None, legend_entries
 
     deck = pdk.Deck(
@@ -1205,6 +1265,62 @@ def build_pydeck_map(
         tooltip={"html": tooltip_html} if tooltip_html else None,
     )
     return deck, legend_entries
+
+
+def _render_map_legends(legend_sections: dict[str, list[tuple[str, str]]]):
+    if not legend_sections:
+        return
+
+    st.markdown("### Map Legend")
+    for section, entries in legend_sections.items():
+        if not entries:
+            continue
+        st.markdown(f"**{section}**")
+        legend_cols = st.columns(min(3, len(entries)))
+        for idx, (label, color) in enumerate(entries):
+            col = legend_cols[idx % len(legend_cols)]
+            col.markdown(
+                "<div style='display:flex; align-items:center; gap:8px;'>"
+                f"<span style='display:inline-block; width:14px; height:14px; background:{color}; border:1px solid #333;'></span>"
+                f"{html.escape(label)}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def _rgba_to_css(rgba: list[int]) -> str:
+    r, g, b, a = rgba
+    alpha = max(0, min(255, a)) / 255
+    return f"rgba({r}, {g}, {b}, {alpha:.2f})"
+
+
+def render_gor_color_legend(vmin: float, vmax: float):
+    if vmin is None or vmax is None:
+        return
+    vmin = float(vmin)
+    vmax = float(vmax)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return
+
+    stops = np.linspace(0.0, 1.0, 6)
+    colors = [
+        _rgba_to_css(_continuous_color_scale(vmin + (vmax - vmin) * t, vmin, vmax))
+        for t in stops
+    ]
+    gradient = ", ".join(f"{color} {int(t * 100)}%" for color, t in zip(colors, stops))
+    mid_value = vmin + (vmax - vmin) / 2
+
+    st.markdown(
+        "<div style='margin-top:0.75rem;'>"
+        "<div style='font-weight:600;'>GOR Colour Scale (mcf/bbl)</div>"
+        f"<div style='height:14px; border-radius:4px; margin:6px 0; background:linear-gradient(90deg, {gradient});'></div>"
+        "<div style='display:flex; justify-content:space-between; font-size:0.8rem;'>"
+        f"<span>{vmin:,.0f}</span>"
+        f"<span>{mid_value:,.0f}</span>"
+        f"<span>{vmax:,.0f}</span>"
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def fetch_single_well_production(gsl_uwi_std: str) -> pd.DataFrame:
@@ -2405,7 +2521,7 @@ def main() -> None:
     sidebar.metric("Wells Displayed", f"{len(filtered_wells):,}")
     sidebar.metric("Confidential Wells", f"{confidential_count:,}")
 
-    deck, legend_entries = build_pydeck_map(
+    deck, legend_sections = build_pydeck_map(
         filtered_wells,
         st.session_state.play_layer_selection,
         st.session_state.company_layer_selection,
@@ -2425,14 +2541,7 @@ def main() -> None:
             st.pydeck_chart(deck)
         else:
             st.info("Apply filters to render the map.")
-        if legend_entries:
-            st.markdown("### Map Legend")
-            legend_cols = st.columns(min(3, len(legend_entries)))
-            for idx, (label, color) in enumerate(legend_entries):
-                col = legend_cols[idx % len(legend_cols)]
-                col.markdown(f"<div style='display:flex; align-items:center; gap:8px;'>"
-                             f"<span style='display:inline-block; width:14px; height:14px; background:{color}; border:1px solid #333;'></span>"
-                             f"{label}</div>", unsafe_allow_html=True)
+        _render_map_legends(legend_sections)
 
     with tab_prod:
         st.subheader("Single Well Analysis")
@@ -2677,10 +2786,11 @@ def main() -> None:
                 if gor_pts.empty:
                     st.info("No GOR points to map.")
                 else:
-                    base_deck, _ = build_pydeck_map(
+                    base_deck, base_legends = build_pydeck_map(
                         filtered_wells,
                         st.session_state.play_layer_selection,
                         st.session_state.company_layer_selection,
+                        include_well_layer=False,
                     )
                     gor_layer = build_gor_pydeck_layer(gor_pts, vmin=float(vmin), vmax=float(vmax))
                     if base_deck is not None and gor_layer is not None:
@@ -2695,6 +2805,9 @@ def main() -> None:
                         }
                         st.pydeck_chart(base_deck)
                         st.caption("Point color = rolling-average GOR (mcf/bbl).")
+                        if base_legends:
+                            _render_map_legends(base_legends)
+                        render_gor_color_legend(float(vmin), float(vmax))
                     else:
                         st.info("Unable to render GOR map with current selection.")
 
