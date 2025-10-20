@@ -283,6 +283,32 @@ def normalize_operator_code_series(series: pd.Series | None) -> pd.Series:
     return normalized
 
 
+def _normalize_province_series(series: pd.Series | None) -> pd.Series:
+    """Normalize province/state strings to consistent uppercase abbreviations."""
+
+    if series is None or not isinstance(series, pd.Series):
+        return pd.Series(dtype=object)
+
+    normalized = series.astype(object)
+    normalized = normalized.where(normalized.notna())
+    normalized = normalized.astype(str).str.strip().str.upper()
+    replacements = {
+        "ALBERTA": "AB",
+        "A.B.": "AB",
+        "AB.": "AB",
+        "BRITISH COLUMBIA": "BC",
+        "B.C.": "BC",
+        "BC.": "BC",
+        "SASKATCHEWAN": "SK",
+        "SASK.": "SK",
+        "MANITOBA": "MB",
+    }
+    normalized = normalized.replace(replacements)
+    normalized = normalized.str.replace(r"[^A-Z]", "", regex=True)
+    normalized = normalized.replace({"": np.nan})
+    return normalized
+
+
 def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -> pd.DataFrame | gpd.GeoDataFrame:
     """Guarantee OperatorName and Formation columns have usable values."""
 
@@ -692,6 +718,9 @@ def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame
     }
     df = df.rename(columns=rename_map)
 
+    if 'ProvinceState' in df.columns:
+        df['ProvinceState'] = _normalize_province_series(df['ProvinceState'])
+
     formation_lookup = get_formation_lookup()
     if formation_lookup and 'StratUnitID' in df.columns:
         df['Formation'] = df.get('Formation').fillna(df['StratUnitID'].map(formation_lookup))
@@ -769,9 +798,13 @@ def _apply_well_filters_in_memory(
 
     if provinces:
         province_series = filtered.get('ProvinceState', pd.Series(index=filtered.index, dtype=object))
-        province_series = province_series.astype(str).str.strip().str.upper()
-        mask = province_series.isin(provinces)
-        filtered = filtered.loc[mask]
+        province_series = _normalize_province_series(province_series)
+        desired = _normalize_province_series(pd.Series(provinces))
+        desired_values = [val for val in desired.dropna().unique().tolist() if val]
+        if desired_values:
+            filtered = filtered.loc[province_series.isin(desired_values)]
+        else:
+            filtered = filtered.iloc[0:0]
 
     if date_range is not None:
         start_ts, end_ts = date_range
@@ -823,8 +856,8 @@ def fetch_wells_from_db(
         normalized_fields = [str(f).strip() for f in fields if str(f).strip()]
 
     if provinces:
-        normalized_provinces = [str(p).strip() for p in provinces if str(p).strip()]
-        normalized_provinces = [val.upper() for val in normalized_provinces]
+        province_series = _normalize_province_series(pd.Series(provinces))
+        normalized_provinces = [val for val in province_series.dropna().unique().tolist() if val]
 
     if date_range and all(date_range):
         start_date, end_date = date_range
@@ -1059,7 +1092,21 @@ def load_and_process_all_data():
 
 # --- Load data into global variables for the app ---
 APP_DATA = load_and_process_all_data()
-wells_gdf_global = ensure_operator_and_formation_columns(APP_DATA['wells_gdf'])
+
+# Initial broad pull so the map shows wells immediately
+try:
+    initial_wells = fetch_wells_from_db(
+        operator_codes=None,
+        formation_ids=None,
+        fields=None,
+        provinces=None,
+        date_range=None,
+    )
+except Exception as exc:
+    print(f"Initial well fetch failed: {exc}")
+    initial_wells = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
+
+wells_gdf_global = ensure_operator_and_formation_columns(initial_wells)
 play_subplay_layers_list_global = APP_DATA['play_subplay_layers_list']
 company_layers_list_global = APP_DATA['company_layers_list']
 
