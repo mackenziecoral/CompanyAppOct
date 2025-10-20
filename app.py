@@ -605,7 +605,7 @@ app_ui = ui.page_fluid(
     ),
     ui.panel_title("Interactive Well and Acreage Map Application (Python Conversion)"),
     ui.layout_sidebar(
-        ui.panel_sidebar(
+        ui.sidebar(
             ui.h4("Well Selection Criteria"),
             # Note: shiny.ui.input_selectize is used as a replacement for shinyWidgets::pickerInput
             ui.input_selectize("operator_filter", "Operator:", choices=[], multiple=True),
