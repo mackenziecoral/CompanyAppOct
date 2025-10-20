@@ -194,10 +194,10 @@ def _render_plotly_chart(fig):
             category=FutureWarning,
         )
         try:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             return
         except TypeError:
-            # Newer versions of Streamlit removed the parameter entirely.
+            # Older Streamlit versions may not support the ``width`` keyword.
             st.plotly_chart(fig)
 
 
@@ -210,7 +210,7 @@ def _render_dataframe(df: pd.DataFrame):
             category=FutureWarning,
         )
         try:
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
             return
         except TypeError:
             st.dataframe(df)
