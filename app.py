@@ -627,84 +627,86 @@ app_ui = ui.page_fluid(
                                choices=initial_company_layer_names, multiple=True),
             width=3
         ),
-        ui.panel_main(
-            ui.navset_tab(
-                ui.nav("Well Map", output_widget("well_map", height="85vh")),
-                ui.nav("Production Analysis",
-                    ui.row(
-                        ui.column(12,
-                            ui.input_selectize("product_type_filter_analysis", "Filter Analyses by Product Type:",
-                                              choices={"Oil": "OIL", "Condensate": "CND", "Gas": "GAS", "BOE (Oil+Cnd+Gas)": "BOE"},
-                                              selected=["OIL", "CND", "GAS", "BOE"],
-                                              multiple=True)
-                        )
+        ui.navset_tab(
+            ui.nav("Well Map", output_widget("well_map", height="85vh")),
+            ui.nav("Production Analysis",
+                ui.row(
+                    ui.column(12,
+                        ui.input_selectize("product_type_filter_analysis", "Filter Analyses by Product Type:",
+                                          choices={"Oil": "OIL", "Condensate": "CND", "Gas": "GAS", "BOE (Oil+Cnd+Gas)": "BOE"},
+                                          selected=["OIL", "CND", "GAS", "BOE"],
+                                          multiple=True)
+                    )
+                ),
+                ui.hr(),
+                ui.navset_tab(
+                    ui.nav("Single Well Analysis",
+                        ui.h4("Daily Production Rate"),
+                        ui.input_select("selected_well_for_prod", "Select Well for Production:", choices=["Apply filters and click a well..."]),
+                        ui.output_ui("production_date_slider_ui"),
+                        ui.output_plot("production_plot", height="45vh"),
+                        ui.hr(),
+                        ui.h5("Production Data Table"),
+                        ui.download_button("download_prod_data", "Download Table as CSV"),
+                        ui.output_data_frame("production_table")
                     ),
-                    ui.hr(),
-                    ui.navset_tab(
-                        ui.nav("Single Well Analysis",
-                            ui.h4("Daily Production Rate"),
-                            ui.input_select("selected_well_for_prod", "Select Well for Production:", choices=["Apply filters and click a well..."]),
-                            ui.output_ui("production_date_slider_ui"),
-                            ui.output_plot("production_plot", height="45vh"),
-                            ui.hr(),
-                            ui.h5("Production Data Table"),
-                            ui.download_button("download_prod_data", "Download Table as CSV"),
-                            ui.output_data_frame("production_table")
+                    ui.nav("Filtered Group Cumulative",
+                        ui.h4("Time Normalized Production by Group (Map-Filtered Wells)"),
+                        ui.p("This analysis uses wells currently displayed on the map. Production is normalized by reported lateral length (if available)."),
+                        ui.row(
+                            ui.column(6, ui.input_select("filtered_group_breakout_by", "Normalize & Group By:",
+                                                         choices={"Operator": "OperatorName", "Formation": "Formation", "Field": "FieldName",
+                                                                  "Province/State": "ProvinceState", "First Prod Year": "FirstProdYear"},
+                                                         selected="OperatorName")),
+                            ui.column(6, ui.input_action_button("calculate_filtered_cumulative", "Calculate Rates", class_="btn-info btn-block", style="margin-top: 25px;"))
                         ),
-                        ui.nav("Filtered Group Cumulative",
-                            ui.h4("Time Normalized Production by Group (Map-Filtered Wells)"),
-                            ui.p("This analysis uses wells currently displayed on the map. Production is normalized by reported lateral length (if available)."),
-                            ui.row(
-                                ui.column(6, ui.input_select("filtered_group_breakout_by", "Normalize & Group By:",
-                                                             choices={"Operator": "OperatorName", "Formation": "Formation", "Field": "FieldName",
-                                                                      "Province/State": "ProvinceState", "First Prod Year": "FirstProdYear"},
-                                                             selected="OperatorName")),
-                                ui.column(6, ui.input_action_button("calculate_filtered_cumulative", "Calculate Rates", class_="btn-info btn-block", style="margin-top: 25px;"))
-                            ),
-                            ui.hr(),
-                            ui.output_ui("filtered_group_plot_title_normalized"),
-                            ui.output_plot("filtered_group_cumulative_plot_normalized", height="45vh"),
-                            ui.hr(),
-                            ui.output_ui("filtered_group_plot_title_cumulative_boe"),
-                            ui.output_plot("filtered_group_cumulative_plot_cumulative_boe", height="45vh"),
-                            ui.hr(),
-                            ui.output_ui("filtered_group_plot_title_calendar_rate"),
-                            ui.output_plot("filtered_group_calendar_rate_plot", height="45vh"),
-                            ui.hr(),
-                            ui.h5("Filtered Group Production Data Summary"),
-                            ui.download_button("download_filtered_group_prod_data", "Download Summary as CSV"),
-                            ui.output_data_frame("filtered_group_production_table")
+                        ui.hr(),
+                        ui.output_ui("filtered_group_plot_title_normalized"),
+                        ui.output_plot("filtered_group_cumulative_plot_normalized", height="45vh"),
+                        ui.hr(),
+                        ui.output_ui("filtered_group_plot_title_cumulative_boe"),
+                        ui.output_plot("filtered_group_cumulative_plot_cumulative_boe", height="45vh"),
+                        ui.hr(),
+                        ui.output_ui("filtered_group_plot_title_calendar_rate"),
+                        ui.output_plot("filtered_group_calendar_rate_plot", height="45vh"),
+                        ui.hr(),
+                        ui.h5("Filtered Group Production Data Summary"),
+                        ui.download_button("download_filtered_group_prod_data", "Download Summary as CSV"),
+                        ui.output_data_frame("filtered_group_production_table")
+                    ),
+                    ui.nav("Type Curve Analysis (Arps)",
+                        ui.h4("Arps Decline Curve (Peak Normalized) for Map-Filtered Wells"),
+                        ui.row(
+                            ui.column(6, ui.input_select("arps_product_type", "Select Product for Arps:",
+                                                         choices={"Oil/Condensate": "Oil", "Gas": "Gas"})),
+                            ui.column(6, ui.input_select("arps_model_type", "Select Arps Model:",
+                                                         choices={"Hyperbolic": "hyperbolic", "Exponential": "exponential", "Harmonic": "harmonic"}))
                         ),
-                        ui.nav("Type Curve Analysis (Arps)",
-                            ui.h4("Arps Decline Curve (Peak Normalized) for Map-Filtered Wells"),
-                            ui.row(
-                                ui.column(6, ui.input_select("arps_product_type", "Select Product for Arps:",
-                                                             choices={"Oil/Condensate": "Oil", "Gas": "Gas"})),
-                                ui.column(6, ui.input_select("arps_model_type", "Select Arps Model:",
-                                                             choices={"Hyperbolic": "hyperbolic", "Exponential": "exponential", "Harmonic": "harmonic"}))
-                            ),
-                            ui.input_action_button("generate_type_curve", "Generate Type Curve", class_="btn-info btn-block"),
-                            ui.hr(),
-                            ui.output_plot("arps_type_curve_plot", height="50vh"),
-                            ui.h5("Fitted Arps Parameters, EUR & Decline Summary:"),
-                            ui.output_text_verbatim("arps_parameters_output"),
-                            ui.hr(),
-                            ui.h5("Aggregated Data Used for Type Curve"),
-                            ui.output_data_frame("arps_data_table")
+                        ui.input_action_button("generate_type_curve", "Generate Type Curve", class_="btn-info btn-block"),
+                        ui.hr(),
+                        ui.output_plot("arps_type_curve_plot", height="50vh"),
+                        ui.h5("Fitted Arps Parameters, EUR & Decline Summary:"),
+                        ui.output_text_verbatim("arps_parameters_output"),
+                        ui.hr(),
+                        ui.h5("Aggregated Data Used for Type Curve"),
+                        ui.output_data_frame("arps_data_table")
+                    ),
+                    ui.nav("Operator Group Cumulative",
+                        ui.h4("Operator Group Average Daily Production Rate"),
+                        ui.p(ui.strong("Note:"), " This tab shows gross production for selected operators over a specific date range, independent of map filters."),
+                        ui.input_selectize("group_operator_filter", "Select Operator(s) to Group:", choices=[], multiple=True),
+                        ui.input_date_range(
+                            "group_prod_date_range",
+                            "Select Date Range:",
+                            start=date.today() - pd.Timedelta(days=365*5),
+                            end=date.today(),
                         ),
-                        ui.nav("Operator Group Cumulative",
-                            ui.h4("Operator Group Average Daily Production Rate"),
-                            ui.p(ui.strong("Note:"), " This tab shows gross production for selected operators over a specific date range, independent of map filters."),
-                            ui.input_selectize("group_operator_filter", "Select Operator(s) to Group:", choices=[], multiple=True),
-                            ui.input_date_range("group_prod_date_range", "Select Date Range:",
-                                                start=date.today() - pd.Timedelta(days=365*5), end=date.today()),
-                            ui.input_action_button("update_group_plot", "Update Operator Group Plot", class_="btn-info"),
-                            ui.hr(),
-                            ui.output_plot("grouped_cumulative_plot", height="50vh"),
-                            ui.h5("Operator Group Production Data Summary"),
-                            ui.download_button("download_group_prod_data", "Download Operator Group Summary as CSV"),
-                            ui.output_data_frame("grouped_production_table")
-                        )
+                        ui.input_action_button("update_group_plot", "Update Operator Group Plot", class_="btn-info"),
+                        ui.hr(),
+                        ui.output_plot("grouped_cumulative_plot", height="50vh"),
+                        ui.h5("Operator Group Production Data Summary"),
+                        ui.download_button("download_group_prod_data", "Download Operator Group Summary as CSV"),
+                        ui.output_data_frame("grouped_production_table")
                     )
                 )
             )
