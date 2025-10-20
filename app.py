@@ -185,6 +185,36 @@ CUSTOM_PALETTE = [
 
 # --- 2. Helper Functions ---
 
+def _render_plotly_chart(fig):
+    """Render a Plotly figure using the widest supported Streamlit API."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*use_container_width.*",
+            category=FutureWarning,
+        )
+        try:
+            st.plotly_chart(fig, use_container_width=True)
+            return
+        except TypeError:
+            # Newer versions of Streamlit removed the parameter entirely.
+            st.plotly_chart(fig)
+
+
+def _render_dataframe(df: pd.DataFrame):
+    """Render a dataframe using the widest supported Streamlit API."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*use_container_width.*",
+            category=FutureWarning,
+        )
+        try:
+            st.dataframe(df, use_container_width=True)
+            return
+        except TypeError:
+            st.dataframe(df)
+
 def standardize_uwi(uwi_series: pd.Series) -> pd.Series:
     """ Replaces R 'standardize_uwi' function. """
     if not isinstance(uwi_series, pd.Series):
@@ -2167,9 +2197,11 @@ def main() -> None:
                 st.error(f"Failed to fetch production data: {exc}")
 
         well_label = selected_well_label if selected_well else "No well selected"
-        st.plotly_chart(make_single_well_rate_chart(processed_prod, selected_products, well_label), use_container_width=True)
+        _render_plotly_chart(
+            make_single_well_rate_chart(processed_prod, selected_products, well_label)
+        )
         st.subheader("Production Data Table")
-        st.dataframe(make_single_well_table(processed_prod), use_container_width=True)
+        _render_dataframe(make_single_well_table(processed_prod))
         if not processed_prod.empty:
             st.download_button(
                 "Download Production CSV",
@@ -2210,12 +2242,12 @@ def main() -> None:
         metrics = st.session_state.filtered_group_metrics
         if metrics:
             norm_fig, cum_fig, cal_fig = make_filtered_group_plots(metrics, st.session_state.filtered_group_breakout)
-            st.plotly_chart(norm_fig, use_container_width=True)
-            st.plotly_chart(cum_fig, use_container_width=True)
-            st.plotly_chart(cal_fig, use_container_width=True)
+            _render_plotly_chart(norm_fig)
+            _render_plotly_chart(cum_fig)
+            _render_plotly_chart(cal_fig)
             st.subheader("Filtered Group Summary")
             table_df = prepare_filtered_group_table(metrics, st.session_state.filtered_group_breakout)
-            st.dataframe(table_df, use_container_width=True)
+            _render_dataframe(table_df)
             st.download_button(
                 "Download Group Summary",
                 data=table_df.to_csv(index=False),
@@ -2253,11 +2285,11 @@ def main() -> None:
                 st.error(str(exc))
         result = st.session_state.type_curve_result
         if result:
-            st.plotly_chart(make_type_curve_plot(result), use_container_width=True)
+            _render_plotly_chart(make_type_curve_plot(result))
             st.text(format_type_curve_summary(result))
             st.subheader("Aggregated Data Used for Type Curve")
             table_df = prepare_type_curve_table(result)
-            st.dataframe(table_df, use_container_width=True)
+            _render_dataframe(table_df)
             st.download_button(
                 "Download Type Curve Table",
                 data=table_df.to_csv(index=False),
@@ -2302,10 +2334,10 @@ def main() -> None:
                 st.session_state.operator_group_df = None
                 st.error(str(exc))
         operator_df = st.session_state.operator_group_df
-        st.plotly_chart(make_operator_group_plot(operator_df), use_container_width=True)
+        _render_plotly_chart(make_operator_group_plot(operator_df))
         st.subheader("Operator Group Summary")
         table_df = prepare_operator_group_table(operator_df) if operator_df is not None else pd.DataFrame({"Message": ["No data."]})
-        st.dataframe(table_df, use_container_width=True)
+        _render_dataframe(table_df)
         if operator_df is not None and not operator_df.empty:
             st.download_button(
                 "Download Operator Summary",
