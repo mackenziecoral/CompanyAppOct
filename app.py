@@ -1314,7 +1314,7 @@ def compute_filtered_group_metrics(
     if 'LateralLength' not in filtered_wells.columns:
         raise ValueError("LateralLength column not available in well data.")
 
-    target_uwis_df = filtered_wells[[
+    target_columns = [
         'GSL_UWI_Std',
         'OperatorName',
         'LateralLength',
@@ -1322,8 +1322,31 @@ def compute_filtered_group_metrics(
         'FieldName',
         'ProvinceState',
         'FirstProdDate',
-    ]].copy()
-    target_uwis_df['FirstProdYear'] = target_uwis_df['FirstProdDate'].dt.year.astype('Int64').astype(str)
+    ]
+    missing_cols = [col for col in target_columns if col not in filtered_wells.columns]
+    if missing_cols:
+        raise RuntimeError(
+            "Filtered wells dataset is missing required columns: " + ", ".join(missing_cols)
+        )
+
+    target_uwis_df = filtered_wells[target_columns].copy()
+    target_uwis_df['FirstProdDate'] = pd.to_datetime(target_uwis_df['FirstProdDate'], errors='coerce')
+
+    first_prod_year = target_uwis_df['FirstProdDate'].dt.year.astype('Int64')
+    target_uwis_df['FirstProdYear'] = first_prod_year.astype(str).replace({'<NA>': 'Unknown'})
+    replacement_map = {'nan': np.nan, 'None': np.nan, '': np.nan, 'NaT': np.nan}
+    target_uwis_df['OperatorName'] = (
+        target_uwis_df['OperatorName'].astype(str).replace(replacement_map).fillna('Unknown')
+    )
+    target_uwis_df['Formation'] = (
+        target_uwis_df['Formation'].astype(str).replace(replacement_map).fillna('Unknown')
+    )
+    target_uwis_df['FieldName'] = (
+        target_uwis_df['FieldName'].astype(str).replace(replacement_map).fillna('Unknown')
+    )
+    target_uwis_df['ProvinceState'] = (
+        target_uwis_df['ProvinceState'].astype(str).replace(replacement_map).fillna('Unknown')
+    )
     target_uwis = target_uwis_df['GSL_UWI_Std'].dropna().astype(str).unique().tolist()
     if not target_uwis:
         raise ValueError("No valid wells to fetch production for.")
@@ -1378,14 +1401,47 @@ def compute_filtered_group_metrics(
     if breakout_col not in prod_merged.columns:
         raise RuntimeError(f"Breakout column {breakout_col} not found after merge.")
 
+    if breakout_col in {'OperatorName', 'Formation', 'FieldName', 'ProvinceState', 'FirstProdYear'}:
+        prod_merged[breakout_col] = (
+            prod_merged[breakout_col]
+            .astype(str)
+            .replace({'nan': np.nan, 'None': np.nan, '<NA>': np.nan, '': np.nan, 'NaT': np.nan})
+            .fillna('Unknown')
+        )
+
     month_cols = [f"{m.upper()}_VOLUME" for m in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']]
+    base_id_vars = [
+        'GSL_UWI_Std',
+        'YEAR',
+        'PRODUCT_TYPE',
+        'LateralLength',
+        'OperatorName',
+        'Formation',
+        'FieldName',
+        'ProvinceState',
+    ]
+    id_vars = list(dict.fromkeys(base_id_vars + [breakout_col]))
+    missing_id_vars = [col for col in id_vars if col not in prod_merged.columns]
+    if missing_id_vars:
+        raise RuntimeError(
+            "Production dataset is missing required columns for melting: " + ", ".join(missing_id_vars)
+        )
+
     prod_long = pd.melt(
         prod_merged,
-        id_vars=['GSL_UWI_Std', 'YEAR', 'PRODUCT_TYPE', 'LateralLength', breakout_col, 'OperatorName', 'Formation', 'FieldName', 'ProvinceState'],
+        id_vars=id_vars,
         value_vars=month_cols,
         var_name='MONTH_COL',
         value_name='VOLUME'
     )
+
+    if breakout_col in prod_long.columns:
+        prod_long[breakout_col] = (
+            prod_long[breakout_col]
+            .astype(str)
+            .replace({'nan': np.nan, 'None': np.nan, '<NA>': np.nan, '': np.nan, 'NaT': np.nan})
+            .fillna('Unknown')
+        )
     prod_long = prod_long.dropna(subset=['VOLUME'])
     prod_long['VOLUME'] = pd.to_numeric(prod_long['VOLUME'], errors='coerce').fillna(0)
     prod_long['MONTH_NUM'] = prod_long['MONTH_COL'].str.extract(r"(\w+)_").iloc[:, 0].map({m.upper(): i for i, m in enumerate(['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], start=1)})
