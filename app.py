@@ -669,115 +669,126 @@ def _drop_duplicate_wells(df: pd.DataFrame) -> pd.DataFrame:
     return work_df
 
 
-def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame:
-    empty_gdf = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
-    empty_gdf.attrs['truncated'] = False
+def _prepare_well_geodf(df: pd.DataFrame) -> gpd.GeoDataFrame:
+    empty_gdf = _empty_well_geodf()
 
     if df is None or df.empty:
         return empty_gdf
 
     df = clean_df_colnames(df, "Filtered Wells from DB")
 
-    if 'UWI' in df.columns:
-        df['UWI_STD'] = standardize_uwi(df['UWI'])
-    else:
-        df['UWI_STD'] = np.nan
-
-    if 'GSL_UWI' in df.columns:
-        df['GSL_UWI_STD'] = standardize_uwi(df['GSL_UWI'])
-    else:
-        df['GSL_UWI_STD'] = np.nan
-
-    if 'STRAT_UNIT_ID' in df.columns:
-        df['STRAT_UNIT_ID'] = df['STRAT_UNIT_ID'].astype(object)
-
-    if 'OPERATOR_CODE' in df.columns:
-        df['OPERATOR_CODE'] = normalize_operator_code_series(df['OPERATOR_CODE'])
-
-    coverage_df = load_operator_coverage_df()
-    if not coverage_df.empty and 'OPERATOR_CODE' in df.columns:
-        coverage_map = dict(zip(coverage_df['OPERATOR_CODE'], coverage_df['OPERATORNAME_DISPLAY']))
-        df['OperatorNameDisplay'] = df['OPERATOR_CODE'].map(coverage_map)
-
     rename_map = {
-        'UWI': 'UWI',
-        'GSL_UWI': 'GSL_UWI',
-        'SURFACE_LATITUDE': 'SurfaceLatitude',
-        'SURFACE_LONGITUDE': 'SurfaceLongitude',
-        'BOTTOM_HOLE_LATITUDE': 'BH_Latitude',
-        'BOTTOM_HOLE_LONGITUDE': 'BH_Longitude',
-        'GSL_FULL_LATERAL_LENGTH': 'LateralLength',
-        'ABANDONMENT_DATE': 'AbandonmentDate',
-        'WELL_NAME': 'WellName',
-        'CURRENT_STATUS': 'CurrentStatus',
-        'OPERATOR_CODE': 'OperatorCode',
-        'STRAT_UNIT_ID': 'StratUnitID',
-        'STRAT_UNIT_NAME': 'Formation',
-        'SPUD_DATE': 'SpudDate',
-        'FIRST_PROD_DATE': 'FirstProdDate',
-        'FINAL_TD': 'FinalTD',
-        'PROVINCE_STATE': 'ProvinceState',
-        'COUNTRY': 'Country',
-        'FIELD_NAME': 'FieldName',
-        'CONFIDENTIAL_TYPE': 'ConfidentialType',
-        'UWI_STD': 'UWI_Std',
-        'GSL_UWI_STD': 'GSL_UWI_Std',
-        'OperatorNameDisplay': 'OperatorName'
+        "OPERATOR_CODE": "OperatorCode",
+        "STRAT_UNIT_ID": "StratUnitID",
+        "STRAT_SHORT_NAME": "Formation",
+        "FIELD_NAME": "FieldName",
+        "PROVINCE_STATE": "ProvinceState",
+        "SPUD_DATE": "SpudDate",
+        "FIRST_PROD_DATE": "FirstProdDate",
+        "GSL_FULL_LATERAL_LENGTH": "LateralLength",
+        "BOTTOM_HOLE_LATITUDE": "BH_Latitude",
+        "BOTTOM_HOLE_LONGITUDE": "BH_Longitude",
     }
     df = df.rename(columns=rename_map)
 
-    if 'ProvinceState' in df.columns:
-        df['ProvinceState'] = _normalize_province_series(df['ProvinceState'])
+    if "ProvinceState" in df.columns:
+        df["ProvinceState"] = _normalize_province_series(df["ProvinceState"])
+
+    if "OperatorCode" in df.columns:
+        df["OperatorCode"] = (
+            df["OperatorCode"].astype(str).str.upper()
+            .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"[^0-9A-Z]", "", regex=True)
+        )
+        df["OperatorCode"] = df["OperatorCode"].replace("", np.nan)
+
+    if "Formation" in df.columns:
+        df["Formation"] = df["Formation"].fillna("").astype(str).str.strip()
+
+    if "StratUnitID" in df.columns:
+        df["StratUnitID"] = df["StratUnitID"].astype(object)
+        df["StratUnitID"] = df["StratUnitID"].where(df["StratUnitID"].notna())
+        df["StratUnitID"] = df["StratUnitID"].astype(str).str.strip()
+        df["StratUnitID"] = df["StratUnitID"].replace({"": np.nan, "NAN": np.nan, "NONE": np.nan})
+
+    if "WELL_NAME" in df.columns:
+        df["WellName"] = df["WELL_NAME"]
+    if "CURRENT_STATUS" in df.columns:
+        df["CurrentStatus"] = df["CURRENT_STATUS"]
+    if "CONFIDENTIAL_TYPE" in df.columns:
+        df["ConfidentialType"] = df["CONFIDENTIAL_TYPE"]
+    if "COUNTRY" in df.columns:
+        df["Country"] = df["COUNTRY"]
+
+    df["SurfaceLatitude"] = pd.to_numeric(df.get("SURFACE_LATITUDE"), errors="coerce")
+    df["SurfaceLongitude"] = pd.to_numeric(df.get("SURFACE_LONGITUDE"), errors="coerce")
+    df["Longitude"] = df["SurfaceLongitude"]
+    df["Latitude"] = df["SurfaceLatitude"]
+
+    coverage_df = load_operator_coverage_df()
+    if not coverage_df.empty and "OperatorCode" in df.columns:
+        coverage_map = dict(
+            zip(coverage_df["OPERATOR_CODE"], coverage_df["OPERATORNAME_DISPLAY"])
+        )
+        df["OperatorNameDisplay"] = df["OperatorCode"].map(coverage_map)
 
     formation_lookup = get_formation_lookup()
-    if formation_lookup and 'StratUnitID' in df.columns:
-        df['Formation'] = df.get('Formation').fillna(df['StratUnitID'].map(formation_lookup))
+    if formation_lookup and "StratUnitID" in df.columns:
+        df["Formation"] = df["Formation"].replace("", np.nan)
+        df["Formation"] = df["Formation"].fillna(df["StratUnitID"].map(formation_lookup))
+        df["Formation"] = df["Formation"].fillna("").astype(str).str.strip()
 
-    operator_lookup = get_operator_display_lookup()
-    if operator_lookup and 'OperatorCode' in df.columns:
-        df['OperatorName'] = df.get('OperatorName').fillna(df['OperatorCode'].map(operator_lookup))
+    numeric_cols = [
+        "BH_Latitude",
+        "BH_Longitude",
+        "LateralLength",
+        "FINAL_TD",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "ABANDONMENT_DATE" in df.columns:
+        df["AbandonmentDate"] = pd.to_datetime(df["ABANDONMENT_DATE"], errors="coerce")
+    if "SpudDate" in df.columns:
+        df["SpudDate"] = pd.to_datetime(df["SpudDate"], errors="coerce")
+    if "FirstProdDate" in df.columns:
+        df["FirstProdDate"] = pd.to_datetime(df["FirstProdDate"], errors="coerce")
+
+    df["UWI_Std"] = standardize_uwi(df.get("UWI", pd.Series(dtype=object)))
+    df["GSL_UWI_Std"] = standardize_uwi(df.get("GSL_UWI", pd.Series(dtype=object)))
+
+    if "FINAL_TD" in df.columns:
+        df["FinalTD"] = df["FINAL_TD"]
+    if "FinalTD" in df.columns:
+        df["FinalTD"] = pd.to_numeric(df["FinalTD"], errors="coerce")
 
     df = ensure_operator_and_formation_columns(df)
-
     df = _drop_duplicate_wells(df)
 
     for col in FINAL_WELL_COLUMNS:
         if col not in df.columns:
-            df[col] = None
+            df[col] = np.nan
 
-    date_cols = ['AbandonmentDate', 'SpudDate', 'FirstProdDate']
-    for col in date_cols:
-        df[col] = pd.to_datetime(df[col], errors='coerce')
-
-    numeric_cols = ['SurfaceLatitude', 'SurfaceLongitude', 'BH_Latitude', 'BH_Longitude', 'LateralLength', 'FinalTD']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    valid_df = df.dropna(subset=['SurfaceLongitude', 'SurfaceLatitude'])
-    if valid_df.empty:
-        result = gpd.GeoDataFrame(
-            df[FINAL_WELL_COLUMNS].copy(),
-            geometry=gpd.GeoSeries([None] * len(df), crs="EPSG:4326"),
-            crs="EPSG:4326"
-        )
-        result.attrs['truncated'] = truncated
-        return result
+    df = df.dropna(subset=["Longitude", "Latitude"])
+    if df.empty:
+        return empty_gdf
 
     gdf = gpd.GeoDataFrame(
-        valid_df[FINAL_WELL_COLUMNS],
-        geometry=gpd.points_from_xy(valid_df.SurfaceLongitude, valid_df.SurfaceLatitude),
-        crs="EPSG:4269"
-    ).to_crs("EPSG:4326")
-    gdf.attrs['truncated'] = truncated
+        df,
+        geometry=gpd.points_from_xy(df["Longitude"], df["Latitude"]),
+        crs="EPSG:4326",
+    )
+    gdf.attrs["truncated"] = False
     return gdf
 
 
 def _apply_well_filters_in_memory(
     wells: gpd.GeoDataFrame,
-    operator_codes: list[str],
-    formation_ids: list[str],
-    fields: list[str],
-    provinces: list[str],
+    operator_codes: list[str] | None,
+    formation_ids: list[str] | None,
+    fields: list[str] | None,
+    provinces: list[str] | None,
     date_range: tuple[pd.Timestamp, pd.Timestamp] | None,
 ) -> gpd.GeoDataFrame:
     if wells is None or wells.empty:
@@ -786,48 +797,49 @@ def _apply_well_filters_in_memory(
     filtered = wells.copy()
 
     if operator_codes:
-        op_series = normalize_operator_code_series(
-            filtered.get('OperatorCode', pd.Series(index=filtered.index, dtype=object))
+        want = (
+            pd.Series(operator_codes)
+            .astype(str)
+            .str.upper()
+            .str.replace(r"[^0-9A-Z]", "", regex=True)
+            .unique()
         )
-        filtered = filtered.loc[op_series.isin(operator_codes)]
+        want = [val for val in want if isinstance(val, str) and val]
+        op_series = filtered.get(
+            "OperatorCode", pd.Series(index=filtered.index, dtype=object)
+        ).astype(str)
+        filtered = filtered[op_series.isin(want)]
 
     if formation_ids:
-        formation_series = filtered.get('Formation', pd.Series(index=filtered.index, dtype=object))
-        strat_series = filtered.get('StratUnitID', pd.Series(index=filtered.index, dtype=object))
-        formation_upper = formation_series.astype(str).str.strip().str.upper()
-        strat_upper = strat_series.astype(str).str.strip().str.upper()
-        mask = formation_upper.isin(formation_ids) | strat_upper.isin(formation_ids)
-        filtered = filtered.loc[mask]
+        want = pd.Series(formation_ids).astype(str).str.strip().unique()
+        want = [val for val in want if val]
+        keep = pd.Series(False, index=filtered.index)
+        if "StratUnitID" in filtered.columns:
+            keep |= filtered["StratUnitID"].astype(str).str.strip().isin(want)
+        if "Formation" in filtered.columns:
+            keep |= filtered["Formation"].astype(str).str.strip().isin(want)
+        filtered = filtered[keep]
 
     if fields:
-        field_series = filtered.get('FieldName', pd.Series(index=filtered.index, dtype=object))
-        mask = field_series.astype(str).str.strip().str.upper().isin([f.upper() for f in fields])
-        filtered = filtered.loc[mask]
+        want = pd.Series(fields).astype(str).str.strip().unique()
+        want = [val for val in want if val]
+        field_series = filtered.get(
+            "FieldName", pd.Series(index=filtered.index, dtype=object)
+        ).astype(str)
+        filtered = filtered[field_series.str.strip().isin(want)]
 
     if provinces:
-        province_series = filtered.get('ProvinceState', pd.Series(index=filtered.index, dtype=object))
-        province_series = _normalize_province_series(province_series)
-        desired = _normalize_province_series(pd.Series(provinces))
-        desired_values = [val for val in desired.dropna().unique().tolist() if val]
-        if desired_values:
-            filtered = filtered.loc[province_series.isin(desired_values)]
-        else:
-            filtered = filtered.iloc[0:0]
+        province_series = _normalize_province_series(filtered.get("ProvinceState"))
+        want = _normalize_province_series(pd.Series(provinces)).unique()
+        want = [val for val in want if isinstance(val, str) and val]
+        filtered = filtered[province_series.isin(want)]
 
-    if date_range is not None:
-        start_ts, end_ts = date_range
-        if pd.notna(start_ts) and pd.notna(end_ts):
-            prod_dates = filtered.get(
-                'FirstProdDate', pd.Series(index=filtered.index, dtype='datetime64[ns]')
-            )
-            spud_dates = filtered.get(
-                'SpudDate', pd.Series(index=filtered.index, dtype='datetime64[ns]')
-            )
-            prod_dates = pd.to_datetime(prod_dates, errors='coerce')
-            spud_dates = pd.to_datetime(spud_dates, errors='coerce')
-            fallback = prod_dates.where(prod_dates.notna(), spud_dates)
-            mask = fallback.between(start_ts, end_ts, inclusive="both")
-            filtered = filtered.loc[mask]
+    if date_range and all(date_range):
+        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+        fp = pd.to_datetime(filtered.get("FirstProdDate"), errors="coerce")
+        sp = pd.to_datetime(filtered.get("SpudDate"), errors="coerce")
+        eff = fp.fillna(sp)
+        filtered = filtered[eff.between(start, end, inclusive="both")]
 
     return filtered
 
@@ -845,72 +857,72 @@ def fetch_wells_from_db(
     if engine is None:
         raise RuntimeError("Database connection not available.")
 
-    normalized_operator_codes: list[str] = []
-    normalized_formations: list[str] = []
-    normalized_fields: list[str] = []
-    normalized_provinces: list[str] = []
     start_ts: pd.Timestamp | None = None
     end_ts: pd.Timestamp | None = None
-
-    if operator_codes:
-        codes_series = normalize_operator_code_series(pd.Series(operator_codes))
-        normalized_operator_codes = [code for code in codes_series.dropna().unique().tolist() if str(code).strip()]
-
-    if formation_ids:
-        normalized_formations = [str(fid).strip() for fid in formation_ids if str(fid).strip()]
-        normalized_formations = [val.upper() for val in normalized_formations]
-
-    if fields:
-        normalized_fields = [str(f).strip() for f in fields if str(f).strip()]
-
-    if provinces:
-        province_series = _normalize_province_series(pd.Series(provinces))
-        normalized_provinces = [val for val in province_series.dropna().unique().tolist() if val]
-
     if date_range and all(date_range):
-        start_date, end_date = date_range
-        start_ts = pd.to_datetime(start_date, errors='coerce')
-        end_ts = pd.to_datetime(end_date, errors='coerce')
+        start_ts = pd.to_datetime(date_range[0], errors="coerce")
+        end_ts = pd.to_datetime(date_range[1], errors="coerce")
         if pd.isna(start_ts) or pd.isna(end_ts):
             start_ts = end_ts = None
 
-    base_filters = _base_well_filters()
-
-    inner_sql = f"""
-        SELECT
-            W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
-            W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
-            W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
-            P.STRAT_UNIT_ID, SU.SHORT_NAME AS STRAT_UNIT_NAME, W.SPUD_DATE, PFS.FIRST_PROD_DATE,
-            W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
-        FROM WELL W
-        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
-        LEFT JOIN STRAT_UNIT SU ON P.STRAT_UNIT_ID = SU.STRAT_UNIT_ID
-        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
-        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
-        WHERE {base_filters}
+    inner_sql = """
+   SELECT
+     W.UWI, W.GSL_UWI,
+     W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
+     W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE,
+     W.GSL_FULL_LATERAL_LENGTH,
+     W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS,
+     W.OPERATOR AS OPERATOR_CODE,
+     W.CONFIDENTIAL_TYPE,
+     P.STRAT_UNIT_ID,
+     W.SPUD_DATE,
+     PFS.FIRST_PROD_DATE,
+     W.FINAL_TD,
+     W.PROVINCE_STATE,
+     W.COUNTRY,
+     FL.FIELD_NAME,
+     SU.SHORT_NAME AS STRAT_SHORT_NAME
+   FROM WELL W
+   LEFT JOIN PDEN P              ON W.GSL_UWI = P.GSL_UWI
+   LEFT JOIN FIELD FL            ON W.ASSIGNED_FIELD = FL.FIELD_ID
+   LEFT JOIN PDEN_FIRST_SUM PFS  ON W.GSL_UWI = PFS.GSL_UWI
+   LEFT JOIN STRAT_UNIT SU       ON P.STRAT_UNIT_ID = SU.STRAT_UNIT_ID
+   WHERE
+     W.SURFACE_LATITUDE  IS NOT NULL
+     AND W.SURFACE_LONGITUDE IS NOT NULL
+     AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
     """
 
-    outer_sql = inner_sql
-    text_obj = text(outer_sql)
+    text_obj = text(inner_sql)
 
     try:
         wells_df = read_sql_resilient(text_obj)
     except Exception as exc:
         raise RuntimeError(f"Failed to fetch wells: {exc}")
 
-    truncated = False
-    processed = _process_well_records(wells_df, truncated)
+    processed = _prepare_well_geodf(wells_df)
     filtered = _apply_well_filters_in_memory(
         processed,
-        normalized_operator_codes,
-        normalized_formations,
-        normalized_fields,
-        normalized_provinces,
+        operator_codes,
+        formation_ids,
+        fields,
+        provinces,
         (start_ts, end_ts) if start_ts is not None and end_ts is not None else None,
     )
-    if processed is not None and hasattr(processed, "attrs") and filtered is not None:
-        filtered.attrs['truncated'] = processed.attrs.get('truncated', False)
+
+    if filtered is None or filtered.empty:
+        if filtered is not None:
+            filtered.attrs["truncated"] = False
+        return filtered
+
+    truncated = False
+    if MAX_WELL_RESULTS:
+        filtered = filtered.sort_values(["ProvinceState", "GSL_UWI"], na_position="last")
+        if len(filtered) > MAX_WELL_RESULTS:
+            truncated = True
+            filtered = filtered.head(MAX_WELL_RESULTS)
+
+    filtered.attrs["truncated"] = truncated
     return filtered
 
 
@@ -1148,12 +1160,25 @@ def load_and_process_all_data():
 # --- Load data into global variables for the app ---
 APP_DATA = load_and_process_all_data()
 
-wells_gdf_global = ensure_operator_and_formation_columns(APP_DATA.get('wells_gdf'))
-if wells_gdf_global is None or wells_gdf_global.empty:
-    wells_gdf_global = _empty_well_geodf()
+wells_gdf_global = _empty_well_geodf()
+try:
+    initial_wells = fetch_wells_from_db(
+        operator_codes=None,
+        formation_ids=None,
+        fields=None,
+        provinces=None,
+        date_range=None,
+    )
+    if initial_wells is not None and not initial_wells.empty:
+        wells_gdf_global = ensure_operator_and_formation_columns(initial_wells)
+        wells_gdf_global.attrs["truncated"] = initial_wells.attrs.get("truncated", False)
+        initial_well_fetch_error = None
+    else:
+        wells_gdf_global = _empty_well_geodf()
+except Exception as exc:
+    initial_well_fetch_error = str(exc)
+    print(f"Initial well fetch failed: {exc}")
 
-_start_initial_well_fetch()
-_drain_initial_well_future()
 
 play_subplay_layers_list_global = APP_DATA['play_subplay_layers_list']
 company_layers_list_global = APP_DATA['company_layers_list']
