@@ -9,6 +9,7 @@ from datetime import datetime, date, timedelta
 import pickle
 from itertools import cycle
 from functools import lru_cache
+from concurrent.futures import Future, ThreadPoolExecutor
 import textwrap
 import sys
 import urllib.parse
@@ -71,6 +72,10 @@ CONNECTION_STRING = f"oracle+oracledb://{DB_USER}:{DB_PASSWORD}@{TNS_ALIAS}"
 
 # Global engine object to hold the database connection pool.
 engine = None
+
+_initial_well_executor: ThreadPoolExecutor | None = None
+_initial_well_future: Future | None = None
+initial_well_fetch_error: str | None = None
 
 def connect_to_db():
     """
@@ -190,6 +195,9 @@ FINAL_WELL_COLUMNS = [
     "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
     "ConfidentialType"
 ]
+
+def _empty_well_geodf() -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
 
 # Custom Color Palette
 CUSTOM_PALETTE = [
@@ -905,6 +913,53 @@ def fetch_wells_from_db(
         filtered.attrs['truncated'] = processed.attrs.get('truncated', False)
     return filtered
 
+
+def _background_initial_well_fetch() -> gpd.GeoDataFrame:
+    try:
+        wells = fetch_wells_from_db(
+            operator_codes=None,
+            formation_ids=None,
+            fields=None,
+            provinces=None,
+            date_range=None,
+        )
+    except Exception as exc:
+        print(f"Initial well fetch failed: {exc}")
+        return _empty_well_geodf()
+    return wells if wells is not None else _empty_well_geodf()
+
+
+def _start_initial_well_fetch() -> None:
+    global _initial_well_executor, _initial_well_future
+    if _initial_well_future is not None:
+        return
+    _initial_well_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="initial_wells")
+    _initial_well_future = _initial_well_executor.submit(_background_initial_well_fetch)
+
+
+def _drain_initial_well_future() -> None:
+    global wells_gdf_global, _initial_well_future, _initial_well_executor, initial_well_fetch_error
+    if _initial_well_future is None:
+        return
+    if not _initial_well_future.done():
+        return
+    try:
+        result = _initial_well_future.result()
+        initial_well_fetch_error = None
+    except Exception as exc:  # pragma: no cover - defensive logging
+        initial_well_fetch_error = str(exc)
+        print(f"Initial well fetch encountered an error: {exc}")
+        result = _empty_well_geodf()
+    wells_gdf_global = ensure_operator_and_formation_columns(result)
+    if _initial_well_executor is not None:
+        _initial_well_executor.shutdown(wait=False)
+    _initial_well_executor = None
+    _initial_well_future = None
+
+
+def initial_well_load_in_progress() -> bool:
+    return _initial_well_future is not None and not _initial_well_future.done()
+
 def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "column") -> list:
     """ Replaces R 'prepare_filter_choices' function for populating dropdowns. """
     if column_series is None or column_series.empty:
@@ -1093,20 +1148,13 @@ def load_and_process_all_data():
 # --- Load data into global variables for the app ---
 APP_DATA = load_and_process_all_data()
 
-# Initial broad pull so the map shows wells immediately
-try:
-    initial_wells = fetch_wells_from_db(
-        operator_codes=None,
-        formation_ids=None,
-        fields=None,
-        provinces=None,
-        date_range=None,
-    )
-except Exception as exc:
-    print(f"Initial well fetch failed: {exc}")
-    initial_wells = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
+wells_gdf_global = ensure_operator_and_formation_columns(APP_DATA.get('wells_gdf'))
+if wells_gdf_global is None or wells_gdf_global.empty:
+    wells_gdf_global = _empty_well_geodf()
 
-wells_gdf_global = ensure_operator_and_formation_columns(initial_wells)
+_start_initial_well_fetch()
+_drain_initial_well_future()
+
 play_subplay_layers_list_global = APP_DATA['play_subplay_layers_list']
 company_layers_list_global = APP_DATA['company_layers_list']
 
@@ -1124,6 +1172,8 @@ if wells_gdf_global is not None and not wells_gdf_global.empty:
             print(f"  '{col}' column IS present. Sample: {wells_gdf_global[col].dropna().head(3).to_list()}")
         else:
             print(f"  '{col}' column IS NOT present.")
+elif initial_well_load_in_progress():
+    print("  wells_gdf_global empty; background initial well fetch in progress.")
 else:
     print("  wells_gdf_global is empty before server starts (wells load on demand).")
 
@@ -2496,6 +2546,8 @@ def _ensure_session_defaults():
         st.session_state.type_curve_error = None
     if 'operator_group_df' not in st.session_state:
         st.session_state.operator_group_df = None
+    if 'seeded_with_initial_wells' not in st.session_state:
+        st.session_state.seeded_with_initial_wells = False
 
 
 def _build_well_selector_options(df: pd.DataFrame) -> dict[str, str]:
@@ -2521,6 +2573,21 @@ def main() -> None:
     st.markdown("This Streamlit interface mirrors the legacy Shiny workflows using Python.")
 
     _ensure_session_defaults()
+    _drain_initial_well_future()
+
+    if (
+        not st.session_state.seeded_with_initial_wells
+        and wells_gdf_global is not None
+        and not wells_gdf_global.empty
+    ):
+        st.session_state.filtered_wells = wells_gdf_global
+        st.session_state.seeded_with_initial_wells = True
+        st.experimental_rerun()
+
+    if initial_well_fetch_error and not st.session_state.seeded_with_initial_wells:
+        st.warning(
+            "Initial well load failed; adjust filters and press Apply to retry the database query."
+        )
 
     sidebar = st.sidebar
     sidebar.header("Well Selection Criteria")
@@ -2620,6 +2687,8 @@ def main() -> None:
         st.session_state.company_layer_selection,
     )
 
+    initial_loading = initial_well_load_in_progress()
+
     tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator, tab_gor = st.tabs([
         "Well Map",
         "Production Analysis",
@@ -2630,11 +2699,19 @@ def main() -> None:
     ])
 
     with tab_map:
-        if deck is not None:
+        if (
+            initial_loading
+            and (filtered_wells is None or filtered_wells.empty)
+            and not st.session_state.seeded_with_initial_wells
+        ):
+            st.info("Loading initial well dataset from Oracle...")
+        elif deck is not None:
             st.pydeck_chart(deck)
         else:
             st.info("Apply filters to render the map.")
         _render_map_legends(legend_sections)
+        if initial_well_fetch_error and not st.session_state.seeded_with_initial_wells:
+            st.error("Initial well fetch failed. Use the filters and Apply Filters to request wells.")
 
     with tab_prod:
         st.subheader("Single Well Analysis")
