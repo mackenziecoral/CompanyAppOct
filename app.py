@@ -332,30 +332,78 @@ def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -
 
 @lru_cache(maxsize=1)
 def load_operator_coverage_df() -> pd.DataFrame:
-    df = safe_read_excel(WOODMACK_COVERAGE_FILE_XLSX, sheet_name="Operator", file_description="Woodmack Coverage (Operator)")
+    """Load Wood Mackenzie coverage and return normalized operator name mappings."""
+
+    df = safe_read_excel(
+        WOODMACK_COVERAGE_FILE_XLSX,
+        sheet_name="Operator",
+        file_description="Woodmack Coverage (Operator)",
+    )
     if df.empty:
-        return pd.DataFrame(columns=['OPERATOR_CODE', 'OPERATORNAME_DISPLAY'])
+        return pd.DataFrame(columns=["OPERATOR_CODE", "OPERATORNAME_DISPLAY"])
 
     df = clean_df_colnames(df, "Operator Coverage from Excel")
-    rename_map = {
-        'OPERATOR': 'OPERATOR_CODE',
-        'GSL_PARENT_BA_NAME': 'OPERATORNAME_DISPLAY'
-    }
-    df = df.rename(columns=rename_map)
 
-    if 'OPERATOR_CODE' not in df.columns:
-        return pd.DataFrame(columns=['OPERATOR_CODE', 'OPERATORNAME_DISPLAY'])
+    # The Excel sheet contains two useful identifiers:
+    #   * OPERATOR  (alphanumeric join key e.g., AB0002)
+    #   * OPERATOR_CODE (numeric shorthand e.g., 2028)
+    # Prefer the alphanumeric key when present so dropdowns can map to DB codes.
+    code_candidates = [
+        "OPERATOR",
+        "WOODMACKJOINOPERATORCODE",
+        "OPERATOR_CODE",
+        "OPERATOR_CODE_1",
+    ]
+    code_frames = {}
+    for column in code_candidates:
+        if column in df.columns:
+            code_frames[column] = normalize_operator_code_series(df[column])
 
-    df['OPERATOR_CODE'] = normalize_operator_code_series(df['OPERATOR_CODE'])
-    if 'OPERATORNAME_DISPLAY' in df.columns:
-        df['OPERATORNAME_DISPLAY'] = df['OPERATORNAME_DISPLAY'].astype(str).str.strip()
+    if not code_frames:
+        return pd.DataFrame(columns=["OPERATOR_CODE", "OPERATORNAME_DISPLAY"])
+
+    code_df = pd.DataFrame(code_frames)
+    code_series = code_df.bfill(axis=1).iloc[:, 0]
+
+    display_candidates = [
+        "GSL_PARENT_BA_NAME",
+        "OPERATORNAME_DISPLAY",
+        "SIMPLE_NAME",
+    ]
+    display_frames = {}
+    for column in display_candidates:
+        if column not in df.columns:
+            continue
+        candidate = df[column].astype(object)
+        candidate = candidate.where(candidate.notna())
+        candidate = candidate.astype(str).str.strip()
+        candidate = candidate.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+        display_frames[column] = candidate
+
+    if display_frames:
+        display_df = pd.DataFrame(display_frames)
+        display_series = display_df.bfill(axis=1).iloc[:, 0]
     else:
-        df['OPERATORNAME_DISPLAY'] = np.nan
+        display_series = pd.Series(dtype=object)
 
-    df = df.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
-    df = df[['OPERATOR_CODE', 'OPERATORNAME_DISPLAY']].dropna()
-    df = df.drop_duplicates(subset=['OPERATOR_CODE'])
-    return df
+    mapping_df = pd.DataFrame({
+        "OPERATOR_CODE": code_series,
+        "OPERATORNAME_DISPLAY": display_series,
+    })
+
+    mapping_df["OPERATOR_CODE"] = normalize_operator_code_series(mapping_df["OPERATOR_CODE"])
+    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].astype(object)
+    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].where(
+        mapping_df["OPERATORNAME_DISPLAY"].notna()
+    )
+
+    mapping_df = mapping_df.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    mapping_df = mapping_df.dropna(subset=["OPERATOR_CODE"])
+    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].fillna(mapping_df["OPERATOR_CODE"])
+    mapping_df["OPERATORNAME_DISPLAY"] = mapping_df["OPERATORNAME_DISPLAY"].astype(str).str.strip()
+    mapping_df = mapping_df.drop_duplicates(subset=["OPERATOR_CODE"])
+
+    return mapping_df[["OPERATOR_CODE", "OPERATORNAME_DISPLAY"]]
 
 
 def _base_well_filters() -> str:
@@ -383,17 +431,24 @@ def get_operator_display_lookup() -> dict[str, str]:
     try:
         operators_df = read_sql_resilient(sql)
     except Exception:
-        return {}
+        operators_df = pd.DataFrame()
+
+    coverage_df = load_operator_coverage_df()
+    coverage_map = (
+        dict(zip(coverage_df['OPERATOR_CODE'], coverage_df['OPERATORNAME_DISPLAY']))
+        if not coverage_df.empty
+        else {}
+    )
 
     if operators_df.empty:
-        return {}
+        return {
+            str(code): str(name) if isinstance(name, str) and name.strip() else str(code)
+            for code, name in coverage_map.items()
+        }
 
     operators_df = clean_df_colnames(operators_df, "Distinct Operator Codes")
     column = 'OPERATOR_CODE' if 'OPERATOR_CODE' in operators_df.columns else operators_df.columns[0]
     codes = normalize_operator_code_series(operators_df[column])
-
-    coverage_df = load_operator_coverage_df()
-    coverage_map = dict(zip(coverage_df['OPERATOR_CODE'], coverage_df['OPERATORNAME_DISPLAY'])) if not coverage_df.empty else {}
 
     lookup: dict[str, str] = {}
     for code in codes.dropna().unique():
@@ -411,7 +466,7 @@ def get_formation_lookup() -> dict[str, str]:
     if engine is None:
         return {}
 
-    sql = text(
+    base_sql = text(
         """
         SELECT DISTINCT P.STRAT_UNIT_ID, SU.SHORT_NAME
         FROM WELL W
@@ -421,9 +476,23 @@ def get_formation_lookup() -> dict[str, str]:
     )
 
     try:
-        strat_df = read_sql_resilient(sql)
+        strat_df = read_sql_resilient(base_sql)
     except Exception:
-        return {}
+        strat_df = pd.DataFrame()
+
+    if strat_df.empty:
+        try:
+            strat_df = read_sql_resilient(
+                text(
+                    """
+                    SELECT STRAT_UNIT_ID, SHORT_NAME
+                    FROM STRAT_UNIT
+                    WHERE STRAT_UNIT_ID IS NOT NULL
+                    """
+                )
+            )
+        except Exception:
+            strat_df = pd.DataFrame()
 
     if strat_df.empty:
         return {}
@@ -1937,7 +2006,10 @@ def main() -> None:
     sidebar.header("Well Selection Criteria")
 
     operator_lookup = get_operator_display_lookup()
-    operator_codes_sorted = sorted(operator_lookup.keys(), key=lambda code: operator_lookup[code])
+    operator_codes_sorted = sorted(
+        operator_lookup.keys(),
+        key=lambda code: operator_lookup[code].upper() if isinstance(operator_lookup[code], str) else str(operator_lookup[code]),
+    )
     operators = sidebar.multiselect(
         "Operator",
         operator_codes_sorted,
@@ -1945,7 +2017,10 @@ def main() -> None:
     )
 
     formation_lookup = get_formation_lookup()
-    formation_ids_sorted = sorted(formation_lookup.keys(), key=lambda fid: formation_lookup[fid])
+    formation_ids_sorted = sorted(
+        formation_lookup.keys(),
+        key=lambda fid: formation_lookup[fid].upper() if isinstance(formation_lookup[fid], str) else str(formation_lookup[fid]),
+    )
     formations = sidebar.multiselect(
         "Formation",
         formation_ids_sorted,
