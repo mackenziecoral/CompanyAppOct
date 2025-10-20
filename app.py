@@ -628,8 +628,8 @@ app_ui = ui.page_fluid(
             width=3
         ),
         ui.navset_tab(
-            ui.nav("Well Map", output_widget("well_map", height="85vh")),
-            ui.nav("Production Analysis",
+            ui.nav_panel("Well Map", output_widget("well_map", height="85vh")),
+            ui.nav_panel("Production Analysis",
                 ui.row(
                     ui.column(12,
                         ui.input_selectize("product_type_filter_analysis", "Filter Analyses by Product Type:",
@@ -640,7 +640,7 @@ app_ui = ui.page_fluid(
                 ),
                 ui.hr(),
                 ui.navset_tab(
-                    ui.nav("Single Well Analysis",
+                    ui.nav_panel("Single Well Analysis",
                         ui.h4("Daily Production Rate"),
                         ui.input_select("selected_well_for_prod", "Select Well for Production:", choices=["Apply filters and click a well..."]),
                         ui.output_ui("production_date_slider_ui"),
@@ -650,7 +650,7 @@ app_ui = ui.page_fluid(
                         ui.download_button("download_prod_data", "Download Table as CSV"),
                         ui.output_data_frame("production_table")
                     ),
-                    ui.nav("Filtered Group Cumulative",
+                    ui.nav_panel("Filtered Group Cumulative",
                         ui.h4("Time Normalized Production by Group (Map-Filtered Wells)"),
                         ui.p("This analysis uses wells currently displayed on the map. Production is normalized by reported lateral length (if available)."),
                         ui.row(
@@ -674,7 +674,7 @@ app_ui = ui.page_fluid(
                         ui.download_button("download_filtered_group_prod_data", "Download Summary as CSV"),
                         ui.output_data_frame("filtered_group_production_table")
                     ),
-                    ui.nav("Type Curve Analysis (Arps)",
+                    ui.nav_panel("Type Curve Analysis (Arps)",
                         ui.h4("Arps Decline Curve (Peak Normalized) for Map-Filtered Wells"),
                         ui.row(
                             ui.column(6, ui.input_select("arps_product_type", "Select Product for Arps:",
@@ -691,7 +691,7 @@ app_ui = ui.page_fluid(
                         ui.h5("Aggregated Data Used for Type Curve"),
                         ui.output_data_frame("arps_data_table")
                     ),
-                    ui.nav("Operator Group Cumulative",
+                    ui.nav_panel("Operator Group Cumulative",
                         ui.h4("Operator Group Average Daily Production Rate"),
                         ui.p(ui.strong("Note:"), " This tab shows gross production for selected operators over a specific date range, independent of map filters."),
                         ui.input_selectize("group_operator_filter", "Select Operator(s) to Group:", choices=[], multiple=True),
