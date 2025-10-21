@@ -170,6 +170,15 @@ APP_DATA_CACHE_VERSION = 2
 PLAY_SUBPLAY_SHAPEFILE_DIR = APP_ROOT / "SubplayShapefile"
 COMPANY_SHAPEFILES_DIR = APP_ROOT / "Shapefile"
 
+GAS_PLANT_ST13_FILE = DATA_DIR / "st13b_2025_detail.csv"
+GAS_PLANT_ST50_FILE = DATA_DIR / "st50_gas_plant_master.csv"
+
+GAS_PLANT_MARKER_MIN_PX = 18
+GAS_PLANT_MARKER_MAX_PX = 42
+GAS_PLANT_RADIUS_MIN_M = 250
+GAS_PLANT_RADIUS_MAX_M = 1300
+GAS_PLANT_UTILIZATION_CLAMP_PCT = 300
+
 # Conversion factors
 E3M3_TO_MCF = 35.3147
 M3_TO_BBL = 6.28981
@@ -364,6 +373,396 @@ def _normalize_province_series(series: pd.Series | None) -> pd.Series:
     return normalized
 
 
+def _normalize_facid_series(series: pd.Series | None) -> pd.Series:
+    """Normalize facility identifiers by stripping whitespace and uppercasing."""
+
+    if series is None or not isinstance(series, pd.Series):
+        return pd.Series(dtype=object)
+
+    normalized = series.astype(object)
+    normalized = normalized.where(normalized.notna(), None)
+    normalized = normalized.astype(str).str.strip().str.upper()
+    normalized = normalized.str.replace(r"\\s+", "", regex=True)
+    normalized = normalized.replace({"": np.nan, "NONE": np.nan, "NAN": np.nan})
+    return normalized
+
+
+def _load_st13_csv(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        print(f"INFO: ST13 monthly file not found at {csv_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # pragma: no cover - safety log only
+        print(f"WARNING: Failed to read ST13 CSV ({exc})")
+        return pd.DataFrame()
+
+    rename_map = {
+        "Gas Plant Disposition (1000 cu.m.)": "gas_throughput_km3",
+        "Facility Latitude": "lat",
+        "Facility Longitude": "lon",
+        "Facility Type": "plant_type",
+        "Facility Sub Type Short Description": "sub_type",
+        "Facility Operator BA Name": "operator",
+        "Facility ID": "facid",
+    }
+
+    df = df.rename(columns={src: dst for src, dst in rename_map.items() if src in df.columns})
+
+    for required in ["gas_throughput_km3", "lat", "lon", "plant_type", "sub_type", "operator", "facid"]:
+        if required not in df.columns:
+            df[required] = np.nan
+
+    df["facid"] = _normalize_facid_series(df.get("facid"))
+    df["gas_throughput_km3"] = pd.to_numeric(df.get("gas_throughput_km3"), errors="coerce")
+    df["lat"] = pd.to_numeric(df.get("lat"), errors="coerce")
+    df["lon"] = pd.to_numeric(df.get("lon"), errors="coerce")
+    df["operator"] = df.get("operator").astype(str).str.strip()
+    df["plant_type"] = df.get("plant_type").fillna("").astype(str).str.strip()
+    df["sub_type"] = df.get("sub_type").fillna("").astype(str).str.strip()
+
+    df["Year"] = pd.to_numeric(df.get("Year"), errors="coerce")
+    df["Month"] = pd.to_numeric(df.get("Month"), errors="coerce")
+    df["ym"] = pd.to_datetime(
+        {"year": df["Year"], "month": df["Month"], "day": 1},
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["facid"])
+    return df
+
+
+def _load_st50_csv(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        print(f"INFO: ST50 master file not found at {csv_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # pragma: no cover - safety log only
+        print(f"WARNING: Failed to read ST50 CSV ({exc})")
+        return pd.DataFrame()
+
+    if (
+        "Licensed Inlet Capacity (1000 m3/d)" not in df.columns
+        and "Licensed Inlet Capacity (mmscfd)" in df.columns
+    ):
+        df["Licensed Inlet Capacity (1000 m3/d)"] = pd.to_numeric(
+            df["Licensed Inlet Capacity (mmscfd)"], errors="coerce"
+        ) * 28.174
+
+    rename_map = {
+        "Licensed Inlet Capacity (1000 m3/d)": "cap_km3_per_d",
+        "Facility Latitude": "lat_cap",
+        "Facility Longitude": "lon_cap",
+        "Facility Operator BA Name": "operator_cap",
+        "Facility Type": "plant_type_cap",
+        "Facility ID": "facid",
+        "Facility Name": "FacilityName",
+    }
+
+    df = df.rename(columns={src: dst for src, dst in rename_map.items() if src in df.columns})
+
+    for required in ["cap_km3_per_d", "lat_cap", "lon_cap", "operator_cap", "plant_type_cap", "facid", "FacilityName"]:
+        if required not in df.columns:
+            df[required] = np.nan
+
+    df["facid"] = _normalize_facid_series(df.get("facid"))
+    df["cap_km3_per_d"] = pd.to_numeric(df.get("cap_km3_per_d"), errors="coerce")
+    df["lat_cap"] = pd.to_numeric(df.get("lat_cap"), errors="coerce")
+    df["lon_cap"] = pd.to_numeric(df.get("lon_cap"), errors="coerce")
+    df["operator_cap"] = df.get("operator_cap").astype(str).str.strip()
+    df["plant_type_cap"] = df.get("plant_type_cap").fillna("").astype(str).str.strip()
+    df["FacilityName"] = df.get("FacilityName").astype(str).str.strip()
+
+    df = df.dropna(subset=["facid"])
+    return df
+
+
+@lru_cache(maxsize=1)
+def load_gas_plant_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
+    st13 = _load_st13_csv(GAS_PLANT_ST13_FILE)
+    st50 = _load_st50_csv(GAS_PLANT_ST50_FILE)
+    return st13, st50
+
+
+def get_gas_plant_month_choices() -> list[str]:
+    st13, _ = load_gas_plant_sources()
+    if st13 is None or st13.empty:
+        return []
+    months = (
+        st13["ym"].dropna().dt.to_period("M").astype(str).sort_values().unique().tolist()
+    )
+    return months
+
+
+def _infer_gas_plant_shape(plant_type: str, sub_type: str) -> str:
+    descriptor = f"{plant_type} {sub_type}".upper()
+    if re.search(r"SOUR|ACID|>=?0\.01|300\b", descriptor):
+        return "triangle"
+    if re.search(r"COMPRESSOR|040\b", descriptor):
+        return "square"
+    return "circle"
+
+
+def _scale_capacity_markers(cap_series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    cap_values = pd.to_numeric(cap_series, errors="coerce").fillna(0)
+    sqrt_vals = np.sqrt(cap_values.clip(lower=0))
+    positive = sqrt_vals[sqrt_vals > 0]
+
+    if positive.empty:
+        marker = pd.Series(GAS_PLANT_MARKER_MIN_PX + 2, index=cap_series.index, dtype=float)
+        radius = pd.Series(GAS_PLANT_RADIUS_MIN_M, index=cap_series.index, dtype=float)
+        return marker, radius
+
+    min_val = positive.min()
+    max_val = positive.max()
+    if math.isclose(min_val, max_val):
+        marker = pd.Series((GAS_PLANT_MARKER_MIN_PX + GAS_PLANT_MARKER_MAX_PX) / 2, index=cap_series.index, dtype=float)
+        radius = pd.Series((GAS_PLANT_RADIUS_MIN_M + GAS_PLANT_RADIUS_MAX_M) / 2, index=cap_series.index, dtype=float)
+        return marker, radius
+
+    normalized = ((sqrt_vals - min_val) / (max_val - min_val)).clip(lower=0)
+    marker = GAS_PLANT_MARKER_MIN_PX + normalized * (GAS_PLANT_MARKER_MAX_PX - GAS_PLANT_MARKER_MIN_PX)
+    radius = GAS_PLANT_RADIUS_MIN_M + normalized * (GAS_PLANT_RADIUS_MAX_M - GAS_PLANT_RADIUS_MIN_M)
+    return marker.astype(float), radius.astype(float)
+
+
+def _assign_operator_palette(operators: pd.Series) -> dict[str, str]:
+    palette = {}
+    color_cycle = cycle(CUSTOM_PALETTE)
+    for value in operators.fillna("Unknown"):
+        key = str(value).strip() or "Unknown"
+        if key not in palette:
+            palette[key] = next(color_cycle)
+    return palette
+
+
+def prepare_gas_plants_for_month(month_label: str | None) -> pd.DataFrame:
+    st13, st50 = load_gas_plant_sources()
+    if (st13 is None or st13.empty) and (st50 is None or st50.empty):
+        return pd.DataFrame()
+
+    st13 = st13.copy() if st13 is not None else pd.DataFrame()
+    st50 = st50.copy() if st50 is not None else pd.DataFrame()
+
+    if month_label:
+        try:
+            selected_month = pd.to_datetime(f"{month_label}-01")
+        except Exception:  # pragma: no cover - defensive parse
+            selected_month = pd.NaT
+    else:
+        selected_month = pd.NaT
+
+    if pd.isna(selected_month) and st13 is not None and not st13.empty:
+        selected_month = st13["ym"].dropna().max()
+
+    if pd.isna(selected_month):
+        return pd.DataFrame()
+
+    # Aggregate ST13 dispositions for the selected month.
+    st13_month = pd.DataFrame()
+    if st13 is not None and not st13.empty:
+        st13_month = (
+            st13[st13["ym"] == selected_month]
+            .groupby("facid", as_index=False)
+            .agg(
+                gas_throughput_km3=("gas_throughput_km3", "sum"),
+                operator=("operator", "first"),
+                plant_type=("plant_type", "first"),
+                sub_type=("sub_type", "first"),
+                lat=("lat", "first"),
+                lon=("lon", "first"),
+            )
+        )
+
+    plants = st13_month
+    if plants.empty:
+        plants = pd.DataFrame({"facid": pd.Series(dtype=object)})
+
+    if st50 is not None and not st50.empty:
+        plants = plants.merge(
+            st50[[
+                "facid",
+                "cap_km3_per_d",
+                "FacilityName",
+                "lat_cap",
+                "lon_cap",
+                "operator_cap",
+                "plant_type_cap",
+            ]],
+            on="facid",
+            how="outer",
+        )
+    else:
+        for col in ["cap_km3_per_d", "FacilityName", "lat_cap", "lon_cap", "operator_cap", "plant_type_cap"]:
+            if col not in plants.columns:
+                plants[col] = np.nan
+
+    plants["FacilityName"] = plants.get("FacilityName").fillna("").astype(str).str.strip()
+    plants.loc[plants["FacilityName"] == "", "FacilityName"] = plants.loc[plants["FacilityName"] == "", "facid"]
+
+    plants["operator"] = plants.get("operator").fillna(plants.get("operator_cap"))
+    plants["operator"] = plants["operator"].astype(str).str.strip().replace({"": "Unknown"})
+    plants["plant_type"] = plants.get("plant_type").fillna(plants.get("plant_type_cap"))
+    plants["plant_type"] = plants["plant_type"].fillna("").astype(str).str.strip()
+    plants["sub_type"] = plants.get("sub_type").fillna("").astype(str).str.strip()
+
+    plants["Latitude"] = plants.get("lat_cap").combine_first(plants.get("lat"))
+    plants["Longitude"] = plants.get("lon_cap").combine_first(plants.get("lon"))
+    plants["Latitude"] = pd.to_numeric(plants["Latitude"], errors="coerce")
+    plants["Longitude"] = pd.to_numeric(plants["Longitude"], errors="coerce")
+
+    plants["cap_km3_per_d"] = pd.to_numeric(plants.get("cap_km3_per_d"), errors="coerce")
+    plants["gas_throughput_km3"] = pd.to_numeric(plants.get("gas_throughput_km3"), errors="coerce").fillna(0.0)
+
+    days_in_month = selected_month.days_in_month
+    # ST13 disposition is monthly 10^3 m³; convert to average daily 10^3 m³/d for apples-to-apples utilisation.
+    plants["throughput_km3_per_d"] = plants["gas_throughput_km3"] / max(days_in_month, 1)
+
+    plants["utilization"] = np.where(
+        plants["cap_km3_per_d"] > 0,
+        plants["throughput_km3_per_d"] / plants["cap_km3_per_d"],
+        np.nan,
+    )
+    plants["utilization_pct"] = (
+        plants["utilization"].astype(float) * 100
+    ).clip(lower=0, upper=GAS_PLANT_UTILIZATION_CLAMP_PCT)
+
+    plants["has_capacity"] = plants["cap_km3_per_d"].fillna(0) > 0
+
+    plants = plants.dropna(subset=["facid"])
+    plants = plants.dropna(subset=["Latitude", "Longitude"], how="any")
+
+    plants["shape"] = plants.apply(
+        lambda row: _infer_gas_plant_shape(row.get("plant_type", ""), row.get("sub_type", "")),
+        axis=1,
+    )
+
+    marker_sizes, radius_values = _scale_capacity_markers(plants["cap_km3_per_d"])
+    plants["marker_size"] = marker_sizes
+    plants["radius_value"] = radius_values
+
+    plants["OperatorDisplay"] = plants["operator"].fillna("Unknown").replace({"": "Unknown"})
+    color_lookup = _assign_operator_palette(plants["OperatorDisplay"])
+    rgba = plants["OperatorDisplay"].map(lambda op: _hex_to_rgba(color_lookup.get(op, "#666666"), alpha=220))
+    plants[["color_r", "color_g", "color_b", "color_a"]] = pd.DataFrame(rgba.tolist(), index=plants.index)
+    plants["OperatorColor"] = plants["OperatorDisplay"].map(lambda op: color_lookup.get(op, "#666666"))
+
+    no_cap_mask = ~plants["has_capacity"]
+    if no_cap_mask.any():
+        plants.loc[no_cap_mask, "utilization"] = np.nan
+        plants.loc[no_cap_mask, "utilization_pct"] = np.nan
+        plants.loc[no_cap_mask, "marker_size"] = GAS_PLANT_MARKER_MIN_PX
+        plants.loc[no_cap_mask, "radius_value"] = GAS_PLANT_RADIUS_MIN_M
+
+    plants["shape_symbol"] = plants["shape"].map({
+        "circle": "●",
+        "square": "■",
+        "triangle": "▲",
+    })
+
+    plants["CapacityDisplay"] = plants["cap_km3_per_d"].apply(lambda x: f"{x:,.1f}" if pd.notna(x) else "NA")
+    plants["ThroughputDisplay"] = plants["throughput_km3_per_d"].apply(lambda x: f"{x:,.1f}" if pd.notna(x) else "NA")
+    plants["UtilizationDisplay"] = plants["utilization_pct"].apply(lambda x: f"{x:,.1f}%" if pd.notna(x) else "NA")
+    plants["month_label"] = selected_month.strftime("%Y-%m")
+
+    plants = plants.sort_values(by=["cap_km3_per_d", "FacilityName"], ascending=[False, True])
+    return plants.reset_index(drop=True)
+
+
+def build_gas_plant_deck(plants_df: pd.DataFrame):
+    if plants_df is None or plants_df.empty:
+        return None, {}, None
+
+    data = plants_df.dropna(subset=["Latitude", "Longitude"]).copy()
+    if data.empty:
+        return None, {}, None
+
+    view_state = pdk.ViewState(
+        latitude=float(data["Latitude"].mean()),
+        longitude=float(data["Longitude"].mean()),
+        zoom=5,
+        pitch=0,
+    )
+
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=data,
+        get_position="[Longitude, Latitude]",
+        get_radius="radius_value",
+        radius_min_pixels=6,
+        radius_max_pixels=60,
+        get_fill_color="[color_r, color_g, color_b, 90]",
+        get_line_color="[color_r, color_g, color_b, 200]",
+        line_width_min_pixels=1,
+        stroked=True,
+        pickable=True,
+    )
+
+    text_layer = pdk.Layer(
+        "TextLayer",
+        data=data,
+        pickable=True,
+        get_position="[Longitude, Latitude]",
+        get_text="shape_symbol",
+        get_color="[color_r, color_g, color_b, 255]",
+        get_size="marker_size",
+        get_alignment_baseline="'center'",
+        get_angle=0,
+    )
+
+    tooltip_html = (
+        "<b>{FacilityName}</b><br/>"
+        "Operator: {OperatorDisplay}<br/>"
+        "Type: {plant_type}<br/>"
+        "Capacity: {CapacityDisplay} (10³ m³/d)<br/>"
+        "Throughput: {ThroughputDisplay} (10³ m³/d)<br/>"
+        "Utilisation: {UtilizationDisplay}<br/>"
+        "Month: {month_label}"
+    )
+
+    deck = pdk.Deck(
+        map_provider="carto",
+        map_style="light",
+        initial_view_state=view_state,
+        layers=[scatter_layer, text_layer],
+        tooltip={"html": tooltip_html},
+    )
+
+    operator_counts = (
+        data["OperatorDisplay"].fillna("Unknown").value_counts().sort_values(ascending=False)
+    )
+    legend_entries: dict[str, list[tuple[str, str]]] = {}
+    if not operator_counts.empty:
+        legend_entries["Operators"] = []
+        color_lookup = (
+            data[["OperatorDisplay", "OperatorColor"]]
+            .drop_duplicates(subset=["OperatorDisplay"], keep="first")
+            .set_index("OperatorDisplay")
+            .to_dict()
+            .get("OperatorColor", {})
+        )
+        for operator, count in operator_counts.head(MAX_OPERATOR_LEGEND_ENTRIES).items():
+            hex_color = color_lookup.get(operator, "#666666")
+            legend_entries["Operators"].append((f"{operator} ({count})", hex_color))
+        if len(operator_counts) > MAX_OPERATOR_LEGEND_ENTRIES:
+            extra = len(operator_counts) - MAX_OPERATOR_LEGEND_ENTRIES
+            legend_entries["Operators"].append((f"+{extra} more", "#b3b3b3"))
+
+    legend_entries["Plant Types"] = [
+        ("Sweet/default (●)", "#333333"),
+        ("Compressor (■)", "#333333"),
+        ("Sour / high-H₂S (▲)", "#333333"),
+    ]
+
+    cap_valid = data.loc[data["has_capacity"], "cap_km3_per_d"].dropna()
+    capacity_range = None
+    if not cap_valid.empty:
+        capacity_range = (float(cap_valid.min()), float(cap_valid.max()))
+
+    return deck, legend_entries, capacity_range
 def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -> pd.DataFrame | gpd.GeoDataFrame:
     """Guarantee OperatorName and Formation columns have usable values."""
 
@@ -2803,13 +3202,14 @@ def main() -> None:
 
     initial_loading = initial_well_load_in_progress()
 
-    tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator, tab_gor = st.tabs([
+    tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator, tab_gor, tab_gas = st.tabs([
         "Well Map",
         "Production Analysis",
         "Filtered Group Cumulative",
         "Type Curve Analysis",
         "Operator Group",
         "GOR",
+        "Gas Plants",
     ])
 
     with tab_map:
@@ -3110,6 +3510,79 @@ def main() -> None:
                             "field_gor_timeseries.csv",
                             "text/csv",
                         )
+
+    with tab_gas:
+        st.subheader("Gas Plant Utilization")
+        st.caption("Size = licensed inlet capacity (10³ m³/d), colour = operator, shape = facility type.")
+
+        st13_src, st50_src = load_gas_plant_sources()
+        if (st13_src is None or st13_src.empty) and (st50_src is None or st50_src.empty):
+            st.info(
+                "Gas plant datasets not available. Place ST13 and ST50 CSV files in the data/ directory to enable this tab."
+            )
+        else:
+            month_choices = get_gas_plant_month_choices()
+            if not month_choices:
+                st.info("No monthly gas plant data available for mapping.")
+            else:
+                default_index = len(month_choices) - 1
+                selected_month = st.selectbox(
+                    "Month",
+                    month_choices,
+                    index=max(default_index, 0),
+                    key="gas_plants_month",
+                )
+
+                plants_month = prepare_gas_plants_for_month(selected_month)
+                if plants_month.empty:
+                    st.info(f"No gas plant records for {selected_month}.")
+                else:
+                    deck, plant_legends, capacity_range = build_gas_plant_deck(plants_month)
+                    if deck is not None:
+                        st.pydeck_chart(deck)
+                        if plant_legends:
+                            _render_map_legends(plant_legends)
+                        if capacity_range:
+                            st.markdown(
+                                f"**Capacity scale (10³ m³/d):** {capacity_range[0]:,.0f} – {capacity_range[1]:,.0f}"
+                            )
+                        st.caption(
+                            "Utilization = average daily gas throughput (10³ m³/d) divided by licensed inlet capacity."
+                        )
+                    else:
+                        st.info("Gas plant coordinates are missing for the selected month.")
+
+                    st.markdown("---")
+                    table_df = plants_month[[
+                        "facid",
+                        "FacilityName",
+                        "OperatorDisplay",
+                        "plant_type",
+                        "cap_km3_per_d",
+                        "throughput_km3_per_d",
+                        "utilization_pct",
+                    ]].copy()
+                    table_df = table_df.rename(columns={
+                        "facid": "Facility ID",
+                        "FacilityName": "Facility",
+                        "OperatorDisplay": "Operator",
+                        "plant_type": "Type",
+                        "cap_km3_per_d": "Capacity (10^3 m3/d)",
+                        "throughput_km3_per_d": "Throughput (10^3 m3/d)",
+                        "utilization_pct": "Utilization %",
+                    })
+                    for col in ["Capacity (10^3 m3/d)", "Throughput (10^3 m3/d)", "Utilization %"]:
+                        table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
+                    table_df["Capacity (10^3 m3/d)"] = table_df["Capacity (10^3 m3/d)"].round(1)
+                    table_df["Throughput (10^3 m3/d)"] = table_df["Throughput (10^3 m3/d)"].round(1)
+                    table_df["Utilization %"] = table_df["Utilization %"].round(1)
+                    _render_dataframe(table_df)
+                    st.download_button(
+                        "Download Gas Plant Table",
+                        data=table_df.to_csv(index=False),
+                        file_name=f"gas_plants_{selected_month}.csv",
+                        mime="text/csv",
+                    )
 
 
 if __name__ == "__main__":
