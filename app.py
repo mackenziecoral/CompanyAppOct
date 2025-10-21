@@ -4,21 +4,24 @@ import re
 import math
 import warnings
 import html
+import base64
 from datetime import datetime, date, timedelta
 import pickle
 from itertools import cycle
 from functools import lru_cache
+from concurrent.futures import Future, ThreadPoolExecutor
 import textwrap
 import sys
 import urllib.parse
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 from sqlalchemy import create_engine, event, text, bindparam
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DatabaseError, SQLAlchemyError
 import oracledb
 from scipy.optimize import curve_fit
 import streamlit as st
@@ -26,6 +29,11 @@ import pydeck as pdk
 import plotly.graph_objects as go
 import plotnine as p9
 from operator_coverage_data import OPERATOR_COVERAGE
+
+try:
+    from embedded_app_data import EMBEDDED_APP_DATA_B64
+except ImportError:
+    EMBEDDED_APP_DATA_B64 = None
 
 # --- Database Connection Details ---
 # (REPLACEMENT BLOCK: use python-oracledb in Thick mode with your Instant Client)
@@ -64,6 +72,10 @@ CONNECTION_STRING = f"oracle+oracledb://{DB_USER}:{DB_PASSWORD}@{TNS_ALIAS}"
 
 # Global engine object to hold the database connection pool.
 engine = None
+
+_initial_well_executor: ThreadPoolExecutor | None = None
+_initial_well_future: Future | None = None
+initial_well_fetch_error: str | None = None
 
 def connect_to_db():
     """
@@ -119,7 +131,6 @@ def connect_to_db():
 engine = connect_to_db()
 
 # --- Resilient SQL read helper (handles ORA-08103 by retrying once) ---
-from sqlalchemy.exc import DatabaseError
 
 def read_sql_resilient(sql_text, params=None, max_retries=1):
     """
@@ -145,26 +156,44 @@ def read_sql_resilient(sql_text, params=None, max_retries=1):
 
 
 # Note on app shutdown: SQLAlchemy's connection pooling is designed to manage
-# connections automatically. Unlike the R Shiny 'onStop', it's not typical
-# in Python web apps to manually close the engine on shutdown. The pool handles
-# stale connections and recycling.
+# connections automatically, so it's not typical in Python web apps to manually
+# close the engine on shutdown. The pool handles stale connections and recycling.
 
 # --- 1. Define File Paths and Constants ---
-# UPDATE THIS PATH TO YOUR LOCAL DIRECTORY
-BASE_PATH = "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac/APP" 
-# Using .pkl (pickle) is a common Python format for saving data structures like DataFrames
-PROCESSED_DATA_FILE = os.path.join(BASE_PATH, "processed_app_data.pkl")
+# All static assets live next to the app source so the tool can ship with
+# pre-processed spatial layers instead of touching raw shapefiles at runtime.
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = APP_ROOT / "data"
+PROCESSED_DATA_FILE = DATA_DIR / "processed_app_data.pkl"
+APP_DATA_CACHE_VERSION = 2
 
-PLAY_SUBPLAY_SHAPEFILE_DIR = os.path.join(BASE_PATH, "SubplayShapefile")
-COMPANY_SHAPEFILES_DIR = os.path.join(BASE_PATH, "Shapefile")
+PLAY_SUBPLAY_SHAPEFILE_DIR = APP_ROOT / "SubplayShapefile"
+COMPANY_SHAPEFILES_DIR = APP_ROOT / "Shapefile"
+
+GAS_PLANT_ST13_FILE = DATA_DIR / "st13b_2025_detail.csv"
+GAS_PLANT_ST50_FILE = DATA_DIR / "st50_gas_plant_master.csv"
+
+GAS_PLANT_MARKER_MIN_PX = 18
+GAS_PLANT_MARKER_MAX_PX = 42
+GAS_PLANT_RADIUS_MIN_M = 250
+GAS_PLANT_RADIUS_MAX_M = 1300
+GAS_PLANT_UTILIZATION_CLAMP_PCT = 300
 
 # Conversion factors
 E3M3_TO_MCF = 35.3147
 M3_TO_BBL = 6.28981
-AVG_DAYS_PER_MONTH = 30.4375
+AVG_DAYS_PER_MONTH = 30.44
+# --- GOR settings
+MAX_MOP_FOR_GOR = 60           # X-axis horizon for trend chart
+MIN_WELLS_PER_POINT = 5        # min wells per point to plot a curve segment
+GOR_CLIP_MAX = 10000           # guardrail for outliers (mcf/bbl)
+GOR_MAP_WINDOW_MONTHS = 6      # rolling window for map coloring (months)
 MCF_PER_BOE = 6  # Standard conversion for BOE calculations
 
-MAX_WELL_RESULTS = 20000
+# --- Map presentation settings
+MAX_OPERATOR_LEGEND_ENTRIES = 12
+
+MAX_WELL_RESULTS = 500000
 
 FINAL_WELL_COLUMNS = [
     "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
@@ -174,6 +203,57 @@ FINAL_WELL_COLUMNS = [
     "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
     "ConfidentialType"
 ]
+
+def _empty_well_geodf() -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
+
+
+def _validate_cached_wells(candidate) -> bool:
+    """Check that a cached wells payload looks usable."""
+
+    if candidate is None:
+        return False
+
+    if isinstance(candidate, gpd.GeoDataFrame):
+        gdf = candidate
+    elif isinstance(candidate, pd.DataFrame):
+        try:
+            gdf = gpd.GeoDataFrame(candidate)
+        except Exception:
+            return False
+    else:
+        return False
+
+    if gdf.empty:
+        return False
+
+    expected_cols = {"SurfaceLatitude", "SurfaceLongitude", "Longitude", "Latitude"}
+    if not expected_cols.issubset(set(gdf.columns)):
+        return False
+
+    if "geometry" not in gdf.columns:
+        return False
+
+    return True
+
+
+def _persist_app_data_cache(app_data: dict) -> None:
+    """Write wells and shapefile payloads to the local cache."""
+
+    try:
+        payload = {
+            "wells_gdf": app_data.get("wells_gdf", _empty_well_geodf()),
+            "play_subplay_layers_list": app_data.get("play_subplay_layers_list", []),
+            "company_layers_list": app_data.get("company_layers_list", []),
+            "__version__": APP_DATA_CACHE_VERSION,
+        }
+        PROCESSED_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(PROCESSED_DATA_FILE, "wb") as f:
+            pickle.dump(payload, f)
+        print(f"Cached app data to: {PROCESSED_DATA_FILE}")
+    except Exception as exc:
+        print(f"Warning: Unable to cache app data ({exc})")
+
 
 # Custom Color Palette
 CUSTOM_PALETTE = [
@@ -194,11 +274,11 @@ def _render_plotly_chart(fig):
             category=FutureWarning,
         )
         try:
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
             return
         except TypeError:
-            # Older Streamlit versions may not support the ``width`` keyword.
-            st.plotly_chart(fig)
+            # Older Streamlit versions may not support ``use_container_width``.
+            st.plotly_chart(fig, config={"responsive": True})
 
 
 def _render_dataframe(df: pd.DataFrame):
@@ -267,6 +347,422 @@ def normalize_operator_code_series(series: pd.Series | None) -> pd.Series:
     return normalized
 
 
+def _normalize_province_series(series: pd.Series | None) -> pd.Series:
+    """Normalize province/state strings to consistent uppercase abbreviations."""
+
+    if series is None or not isinstance(series, pd.Series):
+        return pd.Series(dtype=object)
+
+    normalized = series.astype(object)
+    normalized = normalized.where(normalized.notna())
+    normalized = normalized.astype(str).str.strip().str.upper()
+    replacements = {
+        "ALBERTA": "AB",
+        "A.B.": "AB",
+        "AB.": "AB",
+        "BRITISH COLUMBIA": "BC",
+        "B.C.": "BC",
+        "BC.": "BC",
+        "SASKATCHEWAN": "SK",
+        "SASK.": "SK",
+        "MANITOBA": "MB",
+    }
+    normalized = normalized.replace(replacements)
+    normalized = normalized.str.replace(r"[^A-Z]", "", regex=True)
+    normalized = normalized.replace({"": np.nan})
+    return normalized
+
+
+def _normalize_facid_series(series: pd.Series | None) -> pd.Series:
+    """Normalize facility identifiers by stripping whitespace and uppercasing."""
+
+    if series is None or not isinstance(series, pd.Series):
+        return pd.Series(dtype=object)
+
+    normalized = series.astype(object)
+    normalized = normalized.where(normalized.notna(), None)
+    normalized = normalized.astype(str).str.strip().str.upper()
+    normalized = normalized.str.replace(r"\\s+", "", regex=True)
+    normalized = normalized.replace({"": np.nan, "NONE": np.nan, "NAN": np.nan})
+    return normalized
+
+
+def _load_st13_csv(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        print(f"INFO: ST13 monthly file not found at {csv_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # pragma: no cover - safety log only
+        print(f"WARNING: Failed to read ST13 CSV ({exc})")
+        return pd.DataFrame()
+
+    rename_map = {
+        "Gas Plant Disposition (1000 cu.m.)": "gas_throughput_km3",
+        "Facility Latitude": "lat",
+        "Facility Longitude": "lon",
+        "Facility Type": "plant_type",
+        "Facility Sub Type Short Description": "sub_type",
+        "Facility Operator BA Name": "operator",
+        "Facility ID": "facid",
+    }
+
+    df = df.rename(columns={src: dst for src, dst in rename_map.items() if src in df.columns})
+
+    for required in ["gas_throughput_km3", "lat", "lon", "plant_type", "sub_type", "operator", "facid"]:
+        if required not in df.columns:
+            df[required] = np.nan
+
+    df["facid"] = _normalize_facid_series(df.get("facid"))
+    df["gas_throughput_km3"] = pd.to_numeric(df.get("gas_throughput_km3"), errors="coerce")
+    df["lat"] = pd.to_numeric(df.get("lat"), errors="coerce")
+    df["lon"] = pd.to_numeric(df.get("lon"), errors="coerce")
+    df["operator"] = df.get("operator").astype(str).str.strip()
+    df["plant_type"] = df.get("plant_type").fillna("").astype(str).str.strip()
+    df["sub_type"] = df.get("sub_type").fillna("").astype(str).str.strip()
+
+    df["Year"] = pd.to_numeric(df.get("Year"), errors="coerce")
+    df["Month"] = pd.to_numeric(df.get("Month"), errors="coerce")
+    df["ym"] = pd.to_datetime(
+        {"year": df["Year"], "month": df["Month"], "day": 1},
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["facid"])
+    return df
+
+
+def _load_st50_csv(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        print(f"INFO: ST50 master file not found at {csv_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # pragma: no cover - safety log only
+        print(f"WARNING: Failed to read ST50 CSV ({exc})")
+        return pd.DataFrame()
+
+    if (
+        "Licensed Inlet Capacity (1000 m3/d)" not in df.columns
+        and "Licensed Inlet Capacity (mmscfd)" in df.columns
+    ):
+        df["Licensed Inlet Capacity (1000 m3/d)"] = pd.to_numeric(
+            df["Licensed Inlet Capacity (mmscfd)"], errors="coerce"
+        ) * 28.174
+
+    rename_map = {
+        "Licensed Inlet Capacity (1000 m3/d)": "cap_km3_per_d",
+        "Facility Latitude": "lat_cap",
+        "Facility Longitude": "lon_cap",
+        "Facility Operator BA Name": "operator_cap",
+        "Facility Type": "plant_type_cap",
+        "Facility ID": "facid",
+        "Facility Name": "FacilityName",
+    }
+
+    df = df.rename(columns={src: dst for src, dst in rename_map.items() if src in df.columns})
+
+    for required in ["cap_km3_per_d", "lat_cap", "lon_cap", "operator_cap", "plant_type_cap", "facid", "FacilityName"]:
+        if required not in df.columns:
+            df[required] = np.nan
+
+    df["facid"] = _normalize_facid_series(df.get("facid"))
+    df["cap_km3_per_d"] = pd.to_numeric(df.get("cap_km3_per_d"), errors="coerce")
+    df["lat_cap"] = pd.to_numeric(df.get("lat_cap"), errors="coerce")
+    df["lon_cap"] = pd.to_numeric(df.get("lon_cap"), errors="coerce")
+    df["operator_cap"] = df.get("operator_cap").astype(str).str.strip()
+    df["plant_type_cap"] = df.get("plant_type_cap").fillna("").astype(str).str.strip()
+    df["FacilityName"] = df.get("FacilityName").astype(str).str.strip()
+
+    df = df.dropna(subset=["facid"])
+    return df
+
+
+@lru_cache(maxsize=1)
+def load_gas_plant_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
+    st13 = _load_st13_csv(GAS_PLANT_ST13_FILE)
+    st50 = _load_st50_csv(GAS_PLANT_ST50_FILE)
+    return st13, st50
+
+
+def get_gas_plant_month_choices() -> list[str]:
+    st13, _ = load_gas_plant_sources()
+    if st13 is None or st13.empty:
+        return []
+    months = (
+        st13["ym"].dropna().dt.to_period("M").astype(str).sort_values().unique().tolist()
+    )
+    return months
+
+
+def _infer_gas_plant_shape(plant_type: str, sub_type: str) -> str:
+    descriptor = f"{plant_type} {sub_type}".upper()
+    if re.search(r"SOUR|ACID|>=?0\.01|300\b", descriptor):
+        return "triangle"
+    if re.search(r"COMPRESSOR|040\b", descriptor):
+        return "square"
+    return "circle"
+
+
+def _scale_capacity_markers(cap_series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    cap_values = pd.to_numeric(cap_series, errors="coerce").fillna(0)
+    sqrt_vals = np.sqrt(cap_values.clip(lower=0))
+    positive = sqrt_vals[sqrt_vals > 0]
+
+    if positive.empty:
+        marker = pd.Series(GAS_PLANT_MARKER_MIN_PX + 2, index=cap_series.index, dtype=float)
+        radius = pd.Series(GAS_PLANT_RADIUS_MIN_M, index=cap_series.index, dtype=float)
+        return marker, radius
+
+    min_val = positive.min()
+    max_val = positive.max()
+    if math.isclose(min_val, max_val):
+        marker = pd.Series((GAS_PLANT_MARKER_MIN_PX + GAS_PLANT_MARKER_MAX_PX) / 2, index=cap_series.index, dtype=float)
+        radius = pd.Series((GAS_PLANT_RADIUS_MIN_M + GAS_PLANT_RADIUS_MAX_M) / 2, index=cap_series.index, dtype=float)
+        return marker, radius
+
+    normalized = ((sqrt_vals - min_val) / (max_val - min_val)).clip(lower=0)
+    marker = GAS_PLANT_MARKER_MIN_PX + normalized * (GAS_PLANT_MARKER_MAX_PX - GAS_PLANT_MARKER_MIN_PX)
+    radius = GAS_PLANT_RADIUS_MIN_M + normalized * (GAS_PLANT_RADIUS_MAX_M - GAS_PLANT_RADIUS_MIN_M)
+    return marker.astype(float), radius.astype(float)
+
+
+def _assign_operator_palette(operators: pd.Series) -> dict[str, str]:
+    palette = {}
+    color_cycle = cycle(CUSTOM_PALETTE)
+    for value in operators.fillna("Unknown"):
+        key = str(value).strip() or "Unknown"
+        if key not in palette:
+            palette[key] = next(color_cycle)
+    return palette
+
+
+def prepare_gas_plants_for_month(month_label: str | None) -> pd.DataFrame:
+    st13, st50 = load_gas_plant_sources()
+    if (st13 is None or st13.empty) and (st50 is None or st50.empty):
+        return pd.DataFrame()
+
+    st13 = st13.copy() if st13 is not None else pd.DataFrame()
+    st50 = st50.copy() if st50 is not None else pd.DataFrame()
+
+    if month_label:
+        try:
+            selected_month = pd.to_datetime(f"{month_label}-01")
+        except Exception:  # pragma: no cover - defensive parse
+            selected_month = pd.NaT
+    else:
+        selected_month = pd.NaT
+
+    if pd.isna(selected_month) and st13 is not None and not st13.empty:
+        selected_month = st13["ym"].dropna().max()
+
+    if pd.isna(selected_month):
+        return pd.DataFrame()
+
+    # Aggregate ST13 dispositions for the selected month.
+    st13_month = pd.DataFrame()
+    if st13 is not None and not st13.empty:
+        st13_month = (
+            st13[st13["ym"] == selected_month]
+            .groupby("facid", as_index=False)
+            .agg(
+                gas_throughput_km3=("gas_throughput_km3", "sum"),
+                operator=("operator", "first"),
+                plant_type=("plant_type", "first"),
+                sub_type=("sub_type", "first"),
+                lat=("lat", "first"),
+                lon=("lon", "first"),
+            )
+        )
+
+    plants = st13_month
+    if plants.empty:
+        plants = pd.DataFrame({"facid": pd.Series(dtype=object)})
+
+    if st50 is not None and not st50.empty:
+        plants = plants.merge(
+            st50[[
+                "facid",
+                "cap_km3_per_d",
+                "FacilityName",
+                "lat_cap",
+                "lon_cap",
+                "operator_cap",
+                "plant_type_cap",
+            ]],
+            on="facid",
+            how="outer",
+        )
+    else:
+        for col in ["cap_km3_per_d", "FacilityName", "lat_cap", "lon_cap", "operator_cap", "plant_type_cap"]:
+            if col not in plants.columns:
+                plants[col] = np.nan
+
+    plants["FacilityName"] = plants.get("FacilityName").fillna("").astype(str).str.strip()
+    plants.loc[plants["FacilityName"] == "", "FacilityName"] = plants.loc[plants["FacilityName"] == "", "facid"]
+
+    plants["operator"] = plants.get("operator").fillna(plants.get("operator_cap"))
+    plants["operator"] = plants["operator"].astype(str).str.strip().replace({"": "Unknown"})
+    plants["plant_type"] = plants.get("plant_type").fillna(plants.get("plant_type_cap"))
+    plants["plant_type"] = plants["plant_type"].fillna("").astype(str).str.strip()
+    plants["sub_type"] = plants.get("sub_type").fillna("").astype(str).str.strip()
+
+    plants["Latitude"] = plants.get("lat_cap").combine_first(plants.get("lat"))
+    plants["Longitude"] = plants.get("lon_cap").combine_first(plants.get("lon"))
+    plants["Latitude"] = pd.to_numeric(plants["Latitude"], errors="coerce")
+    plants["Longitude"] = pd.to_numeric(plants["Longitude"], errors="coerce")
+
+    plants["cap_km3_per_d"] = pd.to_numeric(plants.get("cap_km3_per_d"), errors="coerce")
+    plants["gas_throughput_km3"] = pd.to_numeric(plants.get("gas_throughput_km3"), errors="coerce").fillna(0.0)
+
+    days_in_month = selected_month.days_in_month
+    # ST13 disposition is monthly 10^3 m³; convert to average daily 10^3 m³/d for apples-to-apples utilisation.
+    plants["throughput_km3_per_d"] = plants["gas_throughput_km3"] / max(days_in_month, 1)
+
+    plants["utilization"] = np.where(
+        plants["cap_km3_per_d"] > 0,
+        plants["throughput_km3_per_d"] / plants["cap_km3_per_d"],
+        np.nan,
+    )
+    plants["utilization_pct"] = (
+        plants["utilization"].astype(float) * 100
+    ).clip(lower=0, upper=GAS_PLANT_UTILIZATION_CLAMP_PCT)
+
+    plants["has_capacity"] = plants["cap_km3_per_d"].fillna(0) > 0
+
+    plants = plants.dropna(subset=["facid"])
+    plants = plants.dropna(subset=["Latitude", "Longitude"], how="any")
+
+    plants["shape"] = plants.apply(
+        lambda row: _infer_gas_plant_shape(row.get("plant_type", ""), row.get("sub_type", "")),
+        axis=1,
+    )
+
+    marker_sizes, radius_values = _scale_capacity_markers(plants["cap_km3_per_d"])
+    plants["marker_size"] = marker_sizes
+    plants["radius_value"] = radius_values
+
+    plants["OperatorDisplay"] = plants["operator"].fillna("Unknown").replace({"": "Unknown"})
+    color_lookup = _assign_operator_palette(plants["OperatorDisplay"])
+    rgba = plants["OperatorDisplay"].map(lambda op: _hex_to_rgba(color_lookup.get(op, "#666666"), alpha=220))
+    plants[["color_r", "color_g", "color_b", "color_a"]] = pd.DataFrame(rgba.tolist(), index=plants.index)
+    plants["OperatorColor"] = plants["OperatorDisplay"].map(lambda op: color_lookup.get(op, "#666666"))
+
+    no_cap_mask = ~plants["has_capacity"]
+    if no_cap_mask.any():
+        plants.loc[no_cap_mask, "utilization"] = np.nan
+        plants.loc[no_cap_mask, "utilization_pct"] = np.nan
+        plants.loc[no_cap_mask, "marker_size"] = GAS_PLANT_MARKER_MIN_PX
+        plants.loc[no_cap_mask, "radius_value"] = GAS_PLANT_RADIUS_MIN_M
+
+    plants["shape_symbol"] = plants["shape"].map({
+        "circle": "●",
+        "square": "■",
+        "triangle": "▲",
+    })
+
+    plants["CapacityDisplay"] = plants["cap_km3_per_d"].apply(lambda x: f"{x:,.1f}" if pd.notna(x) else "NA")
+    plants["ThroughputDisplay"] = plants["throughput_km3_per_d"].apply(lambda x: f"{x:,.1f}" if pd.notna(x) else "NA")
+    plants["UtilizationDisplay"] = plants["utilization_pct"].apply(lambda x: f"{x:,.1f}%" if pd.notna(x) else "NA")
+    plants["month_label"] = selected_month.strftime("%Y-%m")
+
+    plants = plants.sort_values(by=["cap_km3_per_d", "FacilityName"], ascending=[False, True])
+    return plants.reset_index(drop=True)
+
+
+def build_gas_plant_deck(plants_df: pd.DataFrame):
+    if plants_df is None or plants_df.empty:
+        return None, {}, None
+
+    data = plants_df.dropna(subset=["Latitude", "Longitude"]).copy()
+    if data.empty:
+        return None, {}, None
+
+    view_state = pdk.ViewState(
+        latitude=float(data["Latitude"].mean()),
+        longitude=float(data["Longitude"].mean()),
+        zoom=5,
+        pitch=0,
+    )
+
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=data,
+        get_position="[Longitude, Latitude]",
+        get_radius="radius_value",
+        radius_min_pixels=6,
+        radius_max_pixels=60,
+        get_fill_color="[color_r, color_g, color_b, 90]",
+        get_line_color="[color_r, color_g, color_b, 200]",
+        line_width_min_pixels=1,
+        stroked=True,
+        pickable=True,
+    )
+
+    text_layer = pdk.Layer(
+        "TextLayer",
+        data=data,
+        pickable=True,
+        get_position="[Longitude, Latitude]",
+        get_text="shape_symbol",
+        get_color="[color_r, color_g, color_b, 255]",
+        get_size="marker_size",
+        get_alignment_baseline="'center'",
+        get_angle=0,
+    )
+
+    tooltip_html = (
+        "<b>{FacilityName}</b><br/>"
+        "Operator: {OperatorDisplay}<br/>"
+        "Type: {plant_type}<br/>"
+        "Capacity: {CapacityDisplay} (10³ m³/d)<br/>"
+        "Throughput: {ThroughputDisplay} (10³ m³/d)<br/>"
+        "Utilisation: {UtilizationDisplay}<br/>"
+        "Month: {month_label}"
+    )
+
+    deck = pdk.Deck(
+        map_provider="carto",
+        map_style="light",
+        initial_view_state=view_state,
+        layers=[scatter_layer, text_layer],
+        tooltip={"html": tooltip_html},
+    )
+
+    operator_counts = (
+        data["OperatorDisplay"].fillna("Unknown").value_counts().sort_values(ascending=False)
+    )
+    legend_entries: dict[str, list[tuple[str, str]]] = {}
+    if not operator_counts.empty:
+        legend_entries["Operators"] = []
+        color_lookup = (
+            data[["OperatorDisplay", "OperatorColor"]]
+            .drop_duplicates(subset=["OperatorDisplay"], keep="first")
+            .set_index("OperatorDisplay")
+            .to_dict()
+            .get("OperatorColor", {})
+        )
+        for operator, count in operator_counts.head(MAX_OPERATOR_LEGEND_ENTRIES).items():
+            hex_color = color_lookup.get(operator, "#666666")
+            legend_entries["Operators"].append((f"{operator} ({count})", hex_color))
+        if len(operator_counts) > MAX_OPERATOR_LEGEND_ENTRIES:
+            extra = len(operator_counts) - MAX_OPERATOR_LEGEND_ENTRIES
+            legend_entries["Operators"].append((f"+{extra} more", "#b3b3b3"))
+
+    legend_entries["Plant Types"] = [
+        ("Sweet/default (●)", "#333333"),
+        ("Compressor (■)", "#333333"),
+        ("Sour / high-H₂S (▲)", "#333333"),
+    ]
+
+    cap_valid = data.loc[data["has_capacity"], "cap_km3_per_d"].dropna()
+    capacity_range = None
+    if not cap_valid.empty:
+        capacity_range = (float(cap_valid.min()), float(cap_valid.max()))
+
+    return deck, legend_entries, capacity_range
 def ensure_operator_and_formation_columns(df: pd.DataFrame | gpd.GeoDataFrame) -> pd.DataFrame | gpd.GeoDataFrame:
     """Guarantee OperatorName and Formation columns have usable values."""
 
@@ -589,107 +1085,209 @@ def get_first_prod_bounds() -> tuple[date, date] | None:
     return min_date.date(), max_date.date()
 
 
-def _process_well_records(df: pd.DataFrame, truncated: bool) -> gpd.GeoDataFrame:
-    empty_gdf = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
-    empty_gdf.attrs['truncated'] = False
+def _drop_duplicate_wells(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicate well rows without collapsing records that lack an identifier."""
+
+    if df is None or df.empty:
+        return df
+
+    work_df = df.copy()
+
+    gsl_std_col = next((col for col in ['GSL_UWI_Std', 'GSL_UWI_STD'] if col in work_df.columns), None)
+    if gsl_std_col:
+        non_null = work_df[gsl_std_col].notna()
+        dedup_non_null = work_df.loc[non_null].drop_duplicates(subset=[gsl_std_col])
+
+        dedup_null = work_df.loc[~non_null]
+        if not dedup_null.empty:
+            uwi_std_col = next((col for col in ['UWI_Std', 'UWI_STD'] if col in dedup_null.columns), None)
+            if uwi_std_col:
+                dedup_null = dedup_null.drop_duplicates(subset=[uwi_std_col])
+            elif 'UWI' in dedup_null.columns:
+                dedup_null = dedup_null.drop_duplicates(subset=['UWI'])
+            elif 'GSL_UWI' in dedup_null.columns:
+                dedup_null = dedup_null.drop_duplicates(subset=['GSL_UWI'])
+
+        work_df = pd.concat([dedup_non_null, dedup_null], ignore_index=True)
+    elif 'GSL_UWI' in work_df.columns:
+        work_df = work_df.drop_duplicates(subset=['GSL_UWI'])
+
+    return work_df
+
+
+def _prepare_well_geodf(df: pd.DataFrame) -> gpd.GeoDataFrame:
+    empty_gdf = _empty_well_geodf()
 
     if df is None or df.empty:
         return empty_gdf
 
     df = clean_df_colnames(df, "Filtered Wells from DB")
 
-    if 'UWI' in df.columns:
-        df['UWI_STD'] = standardize_uwi(df['UWI'])
-    else:
-        df['UWI_STD'] = np.nan
-
-    if 'GSL_UWI' in df.columns:
-        df['GSL_UWI_STD'] = standardize_uwi(df['GSL_UWI'])
-    else:
-        df['GSL_UWI_STD'] = np.nan
-
-    if 'STRAT_UNIT_ID' in df.columns:
-        df['STRAT_UNIT_ID'] = df['STRAT_UNIT_ID'].astype(object)
-
-    if 'OPERATOR_CODE' in df.columns:
-        df['OPERATOR_CODE'] = normalize_operator_code_series(df['OPERATOR_CODE'])
-
-    coverage_df = load_operator_coverage_df()
-    if not coverage_df.empty and 'OPERATOR_CODE' in df.columns:
-        coverage_map = dict(zip(coverage_df['OPERATOR_CODE'], coverage_df['OPERATORNAME_DISPLAY']))
-        df['OperatorNameDisplay'] = df['OPERATOR_CODE'].map(coverage_map)
-
     rename_map = {
-        'UWI': 'UWI',
-        'GSL_UWI': 'GSL_UWI',
-        'SURFACE_LATITUDE': 'SurfaceLatitude',
-        'SURFACE_LONGITUDE': 'SurfaceLongitude',
-        'BOTTOM_HOLE_LATITUDE': 'BH_Latitude',
-        'BOTTOM_HOLE_LONGITUDE': 'BH_Longitude',
-        'GSL_FULL_LATERAL_LENGTH': 'LateralLength',
-        'ABANDONMENT_DATE': 'AbandonmentDate',
-        'WELL_NAME': 'WellName',
-        'CURRENT_STATUS': 'CurrentStatus',
-        'OPERATOR_CODE': 'OperatorCode',
-        'STRAT_UNIT_ID': 'StratUnitID',
-        'STRAT_UNIT_NAME': 'Formation',
-        'SPUD_DATE': 'SpudDate',
-        'FIRST_PROD_DATE': 'FirstProdDate',
-        'FINAL_TD': 'FinalTD',
-        'PROVINCE_STATE': 'ProvinceState',
-        'COUNTRY': 'Country',
-        'FIELD_NAME': 'FieldName',
-        'CONFIDENTIAL_TYPE': 'ConfidentialType',
-        'UWI_STD': 'UWI_Std',
-        'GSL_UWI_STD': 'GSL_UWI_Std',
-        'OperatorNameDisplay': 'OperatorName'
+        "OPERATOR_CODE": "OperatorCode",
+        "STRAT_UNIT_ID": "StratUnitID",
+        "STRAT_SHORT_NAME": "Formation",
+        "FIELD_NAME": "FieldName",
+        "PROVINCE_STATE": "ProvinceState",
+        "SPUD_DATE": "SpudDate",
+        "FIRST_PROD_DATE": "FirstProdDate",
+        "GSL_FULL_LATERAL_LENGTH": "LateralLength",
+        "BOTTOM_HOLE_LATITUDE": "BH_Latitude",
+        "BOTTOM_HOLE_LONGITUDE": "BH_Longitude",
     }
     df = df.rename(columns=rename_map)
 
-    formation_lookup = get_formation_lookup()
-    if formation_lookup and 'StratUnitID' in df.columns:
-        df['Formation'] = df.get('Formation').fillna(df['StratUnitID'].map(formation_lookup))
+    if "ProvinceState" in df.columns:
+        df["ProvinceState"] = _normalize_province_series(df["ProvinceState"])
 
-    operator_lookup = get_operator_display_lookup()
-    if operator_lookup and 'OperatorCode' in df.columns:
-        df['OperatorName'] = df.get('OperatorName').fillna(df['OperatorCode'].map(operator_lookup))
+    if "OperatorCode" in df.columns:
+        df["OperatorCode"] = (
+            df["OperatorCode"].astype(str).str.upper()
+            .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"[^0-9A-Z]", "", regex=True)
+        )
+        df["OperatorCode"] = df["OperatorCode"].replace("", np.nan)
+
+    if "Formation" in df.columns:
+        df["Formation"] = df["Formation"].fillna("").astype(str).str.strip()
+
+    if "StratUnitID" in df.columns:
+        df["StratUnitID"] = df["StratUnitID"].astype(object)
+        df["StratUnitID"] = df["StratUnitID"].where(df["StratUnitID"].notna())
+        df["StratUnitID"] = df["StratUnitID"].astype(str).str.strip()
+        df["StratUnitID"] = df["StratUnitID"].replace({"": np.nan, "NAN": np.nan, "NONE": np.nan})
+
+    if "WELL_NAME" in df.columns:
+        df["WellName"] = df["WELL_NAME"]
+    if "CURRENT_STATUS" in df.columns:
+        df["CurrentStatus"] = df["CURRENT_STATUS"]
+    if "CONFIDENTIAL_TYPE" in df.columns:
+        df["ConfidentialType"] = df["CONFIDENTIAL_TYPE"]
+    if "COUNTRY" in df.columns:
+        df["Country"] = df["COUNTRY"]
+
+    df["SurfaceLatitude"] = pd.to_numeric(df.get("SURFACE_LATITUDE"), errors="coerce")
+    df["SurfaceLongitude"] = pd.to_numeric(df.get("SURFACE_LONGITUDE"), errors="coerce")
+    df["Longitude"] = df["SurfaceLongitude"]
+    df["Latitude"] = df["SurfaceLatitude"]
+
+    coverage_df = load_operator_coverage_df()
+    if not coverage_df.empty and "OperatorCode" in df.columns:
+        coverage_map = dict(
+            zip(coverage_df["OPERATOR_CODE"], coverage_df["OPERATORNAME_DISPLAY"])
+        )
+        df["OperatorNameDisplay"] = df["OperatorCode"].map(coverage_map)
+
+    formation_lookup = get_formation_lookup()
+    if formation_lookup and "StratUnitID" in df.columns:
+        df["Formation"] = df["Formation"].replace("", np.nan)
+        df["Formation"] = df["Formation"].fillna(df["StratUnitID"].map(formation_lookup))
+        df["Formation"] = df["Formation"].fillna("").astype(str).str.strip()
+
+    numeric_cols = [
+        "BH_Latitude",
+        "BH_Longitude",
+        "LateralLength",
+        "FINAL_TD",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "ABANDONMENT_DATE" in df.columns:
+        df["AbandonmentDate"] = pd.to_datetime(df["ABANDONMENT_DATE"], errors="coerce")
+    if "SpudDate" in df.columns:
+        df["SpudDate"] = pd.to_datetime(df["SpudDate"], errors="coerce")
+    if "FirstProdDate" in df.columns:
+        df["FirstProdDate"] = pd.to_datetime(df["FirstProdDate"], errors="coerce")
+
+    df["UWI_Std"] = standardize_uwi(df.get("UWI", pd.Series(dtype=object)))
+    df["GSL_UWI_Std"] = standardize_uwi(df.get("GSL_UWI", pd.Series(dtype=object)))
+
+    if "FINAL_TD" in df.columns:
+        df["FinalTD"] = df["FINAL_TD"]
+    if "FinalTD" in df.columns:
+        df["FinalTD"] = pd.to_numeric(df["FinalTD"], errors="coerce")
 
     df = ensure_operator_and_formation_columns(df)
-
-    if 'GSL_UWI_Std' in df.columns:
-        df = df.drop_duplicates(subset=['GSL_UWI_Std'])
-    elif 'GSL_UWI' in df.columns:
-        df = df.drop_duplicates(subset=['GSL_UWI'])
+    df = _drop_duplicate_wells(df)
 
     for col in FINAL_WELL_COLUMNS:
         if col not in df.columns:
-            df[col] = None
+            df[col] = np.nan
 
-    date_cols = ['AbandonmentDate', 'SpudDate', 'FirstProdDate']
-    for col in date_cols:
-        df[col] = pd.to_datetime(df[col], errors='coerce')
-
-    numeric_cols = ['SurfaceLatitude', 'SurfaceLongitude', 'BH_Latitude', 'BH_Longitude', 'LateralLength', 'FinalTD']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    valid_df = df.dropna(subset=['SurfaceLongitude', 'SurfaceLatitude'])
-    if valid_df.empty:
-        result = gpd.GeoDataFrame(
-            df[FINAL_WELL_COLUMNS].copy(),
-            geometry=gpd.GeoSeries([None] * len(df), crs="EPSG:4326"),
-            crs="EPSG:4326"
-        )
-        result.attrs['truncated'] = truncated
-        return result
+    df = df.dropna(subset=["Longitude", "Latitude"])
+    if df.empty:
+        return empty_gdf
 
     gdf = gpd.GeoDataFrame(
-        valid_df[FINAL_WELL_COLUMNS],
-        geometry=gpd.points_from_xy(valid_df.SurfaceLongitude, valid_df.SurfaceLatitude),
-        crs="EPSG:4269"
-    ).to_crs("EPSG:4326")
-    gdf.attrs['truncated'] = truncated
+        df,
+        geometry=gpd.points_from_xy(df["Longitude"], df["Latitude"]),
+        crs="EPSG:4326",
+    )
+    gdf.attrs["truncated"] = False
     return gdf
+
+
+def _apply_well_filters_in_memory(
+    wells: gpd.GeoDataFrame,
+    operator_codes: list[str] | None,
+    formation_ids: list[str] | None,
+    fields: list[str] | None,
+    provinces: list[str] | None,
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None,
+) -> gpd.GeoDataFrame:
+    if wells is None or wells.empty:
+        return wells
+
+    filtered = wells.copy()
+
+    if operator_codes:
+        want = (
+            pd.Series(operator_codes)
+            .astype(str)
+            .str.upper()
+            .str.replace(r"[^0-9A-Z]", "", regex=True)
+            .unique()
+        )
+        want = [val for val in want if isinstance(val, str) and val]
+        op_series = filtered.get(
+            "OperatorCode", pd.Series(index=filtered.index, dtype=object)
+        ).astype(str)
+        filtered = filtered[op_series.isin(want)]
+
+    if formation_ids:
+        want = pd.Series(formation_ids).astype(str).str.strip().unique()
+        want = [val for val in want if val]
+        keep = pd.Series(False, index=filtered.index)
+        if "StratUnitID" in filtered.columns:
+            keep |= filtered["StratUnitID"].astype(str).str.strip().isin(want)
+        if "Formation" in filtered.columns:
+            keep |= filtered["Formation"].astype(str).str.strip().isin(want)
+        filtered = filtered[keep]
+
+    if fields:
+        want = pd.Series(fields).astype(str).str.strip().unique()
+        want = [val for val in want if val]
+        field_series = filtered.get(
+            "FieldName", pd.Series(index=filtered.index, dtype=object)
+        ).astype(str)
+        filtered = filtered[field_series.str.strip().isin(want)]
+
+    if provinces:
+        province_series = _normalize_province_series(filtered.get("ProvinceState"))
+        want = _normalize_province_series(pd.Series(provinces)).unique()
+        want = [val for val in want if isinstance(val, str) and val]
+        filtered = filtered[province_series.isin(want)]
+
+    if date_range and all(date_range):
+        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+        fp = pd.to_datetime(filtered.get("FirstProdDate"), errors="coerce")
+        sp = pd.to_datetime(filtered.get("SpudDate"), errors="coerce")
+        eff = fp.fillna(sp)
+        filtered = filtered[eff.between(start, end, inclusive="both")]
+
+    return filtered
 
 
 def fetch_wells_from_db(
@@ -705,82 +1303,120 @@ def fetch_wells_from_db(
     if engine is None:
         raise RuntimeError("Database connection not available.")
 
-    params: dict[str, object] = {}
-    optional_clauses: list[str] = []
-
-    if operator_codes:
-        codes_series = normalize_operator_code_series(pd.Series(operator_codes))
-        normalized_codes = [code for code in codes_series.dropna().unique().tolist() if str(code).strip()]
-        if normalized_codes:
-            optional_clauses.append("W.OPERATOR IN :operator_codes")
-            params['operator_codes'] = [str(code) for code in normalized_codes]
-
-    if formation_ids:
-        normalized_formations = [str(fid).strip() for fid in formation_ids if str(fid).strip()]
-        if normalized_formations:
-            optional_clauses.append("P.STRAT_UNIT_ID IN :formation_ids")
-            params['formation_ids'] = normalized_formations
-
-    if fields:
-        normalized_fields = [str(f).strip() for f in fields if str(f).strip()]
-        if normalized_fields:
-            optional_clauses.append("FL.FIELD_NAME IN :fields")
-            params['fields'] = normalized_fields
-
-    if provinces:
-        normalized_provinces = [str(p).strip() for p in provinces if str(p).strip()]
-        if normalized_provinces:
-            optional_clauses.append("W.PROVINCE_STATE IN :provinces")
-            params['provinces'] = normalized_provinces
-
+    start_ts: pd.Timestamp | None = None
+    end_ts: pd.Timestamp | None = None
     if date_range and all(date_range):
-        start_date, end_date = date_range
-        start_ts = pd.to_datetime(start_date, errors='coerce')
-        end_ts = pd.to_datetime(end_date, errors='coerce')
-        if pd.notna(start_ts) and pd.notna(end_ts):
-            optional_clauses.append("PFS.FIRST_PROD_DATE BETWEEN :first_prod_start AND :first_prod_end")
-            params['first_prod_start'] = start_ts
-            params['first_prod_end'] = end_ts
+        start_ts = pd.to_datetime(date_range[0], errors="coerce")
+        end_ts = pd.to_datetime(date_range[1], errors="coerce")
+        if pd.isna(start_ts) or pd.isna(end_ts):
+            start_ts = end_ts = None
 
-    base_filters = _base_well_filters()
-    if optional_clauses:
-        base_filters = base_filters + "\n  AND " + "\n  AND ".join(optional_clauses)
-
-    inner_sql = f"""
-        SELECT DISTINCT
-            W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
-            W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH,
-            W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE,
-            P.STRAT_UNIT_ID, SU.SHORT_NAME AS STRAT_UNIT_NAME, W.SPUD_DATE, PFS.FIRST_PROD_DATE,
-            W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME
-        FROM WELL W
-        LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI
-        LEFT JOIN STRAT_UNIT SU ON P.STRAT_UNIT_ID = SU.STRAT_UNIT_ID
-        LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID
-        LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI
-        WHERE {base_filters}
+    inner_sql = """
+   SELECT
+     W.UWI, W.GSL_UWI,
+     W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE,
+     W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE,
+     W.GSL_FULL_LATERAL_LENGTH,
+     W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS,
+     W.OPERATOR AS OPERATOR_CODE,
+     W.CONFIDENTIAL_TYPE,
+     P.STRAT_UNIT_ID,
+     W.SPUD_DATE,
+     PFS.FIRST_PROD_DATE,
+     W.FINAL_TD,
+     W.PROVINCE_STATE,
+     W.COUNTRY,
+     FL.FIELD_NAME,
+     SU.SHORT_NAME AS STRAT_SHORT_NAME
+   FROM WELL W
+   LEFT JOIN PDEN P              ON W.GSL_UWI = P.GSL_UWI
+   LEFT JOIN FIELD FL            ON W.ASSIGNED_FIELD = FL.FIELD_ID
+   LEFT JOIN PDEN_FIRST_SUM PFS  ON W.GSL_UWI = PFS.GSL_UWI
+   LEFT JOIN STRAT_UNIT SU       ON P.STRAT_UNIT_ID = SU.STRAT_UNIT_ID
+   WHERE
+     W.SURFACE_LATITUDE  IS NOT NULL
+     AND W.SURFACE_LONGITUDE IS NOT NULL
+     AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))
     """
 
-    outer_sql = f"SELECT * FROM ({inner_sql}) WHERE ROWNUM <= :max_rows"
-    params['max_rows'] = MAX_WELL_RESULTS
-
-    text_obj = text(outer_sql)
-    if 'operator_codes' in params:
-        text_obj = text_obj.bindparams(bindparam('operator_codes', expanding=True))
-    if 'formation_ids' in params:
-        text_obj = text_obj.bindparams(bindparam('formation_ids', expanding=True))
-    if 'fields' in params:
-        text_obj = text_obj.bindparams(bindparam('fields', expanding=True))
-    if 'provinces' in params:
-        text_obj = text_obj.bindparams(bindparam('provinces', expanding=True))
+    text_obj = text(inner_sql)
 
     try:
-        wells_df = read_sql_resilient(text_obj, params=params)
+        wells_df = read_sql_resilient(text_obj)
     except Exception as exc:
         raise RuntimeError(f"Failed to fetch wells: {exc}")
 
-    truncated = len(wells_df) >= MAX_WELL_RESULTS if wells_df is not None else False
-    return _process_well_records(wells_df, truncated)
+    processed = _prepare_well_geodf(wells_df)
+    filtered = _apply_well_filters_in_memory(
+        processed,
+        operator_codes,
+        formation_ids,
+        fields,
+        provinces,
+        (start_ts, end_ts) if start_ts is not None and end_ts is not None else None,
+    )
+
+    if filtered is None or filtered.empty:
+        if filtered is not None:
+            filtered.attrs["truncated"] = False
+        return filtered
+
+    truncated = False
+    if MAX_WELL_RESULTS:
+        filtered = filtered.sort_values(["ProvinceState", "GSL_UWI"], na_position="last")
+        if len(filtered) > MAX_WELL_RESULTS:
+            truncated = True
+            filtered = filtered.head(MAX_WELL_RESULTS)
+
+    filtered.attrs["truncated"] = truncated
+    return filtered
+
+
+def _background_initial_well_fetch() -> gpd.GeoDataFrame:
+    try:
+        wells = fetch_wells_from_db(
+            operator_codes=None,
+            formation_ids=None,
+            fields=None,
+            provinces=None,
+            date_range=None,
+        )
+    except Exception as exc:
+        print(f"Initial well fetch failed: {exc}")
+        return _empty_well_geodf()
+    return wells if wells is not None else _empty_well_geodf()
+
+
+def _start_initial_well_fetch() -> None:
+    global _initial_well_executor, _initial_well_future
+    if _initial_well_future is not None:
+        return
+    _initial_well_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="initial_wells")
+    _initial_well_future = _initial_well_executor.submit(_background_initial_well_fetch)
+
+
+def _drain_initial_well_future() -> None:
+    global wells_gdf_global, _initial_well_future, _initial_well_executor, initial_well_fetch_error
+    if _initial_well_future is None:
+        return
+    if not _initial_well_future.done():
+        return
+    try:
+        result = _initial_well_future.result()
+        initial_well_fetch_error = None
+    except Exception as exc:  # pragma: no cover - defensive logging
+        initial_well_fetch_error = str(exc)
+        print(f"Initial well fetch encountered an error: {exc}")
+        result = _empty_well_geodf()
+    wells_gdf_global = ensure_operator_and_formation_columns(result)
+    if _initial_well_executor is not None:
+        _initial_well_executor.shutdown(wait=False)
+    _initial_well_executor = None
+    _initial_well_future = None
+
+
+def initial_well_load_in_progress() -> bool:
+    return _initial_well_future is not None and not _initial_well_future.done()
 
 def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "column") -> list:
     """ Replaces R 'prepare_filter_choices' function for populating dropdowns. """
@@ -803,17 +1439,18 @@ def prepare_filter_choices(column_series: pd.Series, col_name_for_msg: str = "co
     
     return unique_choices
 
-def load_process_spatial_layer(shp_path: str, layer_name: str, target_crs: int = 4326, 
-                               simplify: bool = False, tolerance: float = None, 
+def load_process_spatial_layer(shp_path: str | Path, layer_name: str, target_crs: int = 4326,
+                               simplify: bool = False, tolerance: float = None,
                                make_valid_geom: bool = False) -> gpd.GeoDataFrame | None:
     """ Replaces R 'load_process_spatial_layer' using GeoPandas. """
+    shp_path = Path(shp_path)
     print(f"--- Start Processing Layer: {layer_name} ---")
     print(f"Shapefile path: {shp_path}")
     try:
-        if not os.path.exists(shp_path):
+        if not shp_path.exists():
             warnings.warn(f"Shapefile does not exist at path: {shp_path} for layer {layer_name}")
             return None
-        
+
         data_gdf = gpd.read_file(shp_path)
         if data_gdf.empty:
             warnings.warn(f"Shapefile for layer {layer_name} is empty.")
@@ -870,58 +1507,95 @@ def geometric_mean(x: pd.Series, na_rm: bool = True) -> float:
 # This function encapsulates the entire data loading and preprocessing logic from the R script.
 def load_and_process_all_data():
 
-    empty_gdf = gpd.GeoDataFrame(columns=FINAL_WELL_COLUMNS, geometry=[], crs="EPSG:4326")
+    empty_gdf = _empty_well_geodf()
 
     app_data = {
         'wells_gdf': empty_gdf,
         'play_subplay_layers_list': [],
         'company_layers_list': []
     }
+    cache_dirty = False
+    load_wells_from_db = True
 
-    if os.path.exists(PROCESSED_DATA_FILE):
-        print(f"Attempting to load cached layers from: {PROCESSED_DATA_FILE}")
+    def _apply_cached_payload(loaded_data, source_label: str) -> None:
+        nonlocal app_data, load_wells_from_db
+        if not isinstance(loaded_data, dict):
+            print(f"INFO: {source_label} payload missing or invalid; will refresh from source files.")
+            return
+        if loaded_data.get('__version__') != APP_DATA_CACHE_VERSION:
+            print(f"INFO: {source_label} payload missing or outdated; will refresh from source files.")
+            return
+
+        play_layers = loaded_data.get('play_subplay_layers_list', [])
+        if isinstance(play_layers, list) and play_layers:
+            app_data['play_subplay_layers_list'] = play_layers
+            print(f"SUCCESS: Loaded play/subplay layers from {source_label}.")
+
+        company_layers = loaded_data.get('company_layers_list', [])
+        if isinstance(company_layers, list) and company_layers:
+            app_data['company_layers_list'] = company_layers
+            print(f"SUCCESS: Loaded company layers from {source_label}.")
+
+        wells_candidate = loaded_data.get('wells_gdf')
+        if _validate_cached_wells(wells_candidate):
+            if isinstance(wells_candidate, gpd.GeoDataFrame):
+                wells_gdf = wells_candidate.copy()
+            else:
+                wells_gdf = gpd.GeoDataFrame(wells_candidate)
+            wells_gdf = ensure_operator_and_formation_columns(wells_gdf)
+            wells_gdf.attrs['truncated'] = wells_candidate.attrs.get('truncated', False)
+            app_data['wells_gdf'] = wells_gdf
+            load_wells_from_db = False
+            print(f"SUCCESS: Loaded wells from {source_label}.")
+        else:
+            print(f"INFO: {source_label} wells payload missing or invalid; will refetch from Oracle.")
+
+    if EMBEDDED_APP_DATA_B64:
+        try:
+            embedded_bytes = base64.b64decode(EMBEDDED_APP_DATA_B64)
+            loaded_data = pickle.loads(embedded_bytes)
+            _apply_cached_payload(loaded_data, 'embedded payload')
+        except Exception as exc:
+            print(f"WARNING: Unable to hydrate embedded payload ({exc}).")
+
+    if PROCESSED_DATA_FILE.exists():
+        print(f"Attempting to load cached data from: {PROCESSED_DATA_FILE}")
         try:
             with open(PROCESSED_DATA_FILE, 'rb') as f:
                 loaded_data = pickle.load(f)
-            if isinstance(loaded_data, dict):
-                play_layers = loaded_data.get('play_subplay_layers_list', [])
-                company_layers = loaded_data.get('company_layers_list', [])
-                if isinstance(play_layers, list) and play_layers:
-                    app_data['play_subplay_layers_list'] = play_layers
-                if isinstance(company_layers, list) and company_layers:
-                    app_data['company_layers_list'] = company_layers
-                print("SUCCESS: Loaded shapefile layers from cache.")
+            _apply_cached_payload(loaded_data, 'cache')
         except Exception as e:
             print(f"WARNING: Unable to load cached data ({e}). Will rebuild from source files.")
 
     if not app_data['play_subplay_layers_list']:
         print("--- Loading Play/Subplay Acreage ---")
         play_layers: list[dict] = []
-        if os.path.isdir(PLAY_SUBPLAY_SHAPEFILE_DIR):
+        if PLAY_SUBPLAY_SHAPEFILE_DIR.is_dir():
             for root_dir, _, files in os.walk(PLAY_SUBPLAY_SHAPEFILE_DIR):
                 for filename in files:
                     if filename.lower().endswith('.shp'):
-                        shp_path = os.path.join(root_dir, filename)
-                        layer_name = os.path.splitext(filename)[0]
+                        shp_path = Path(root_dir) / filename
+                        layer_name = Path(filename).stem
                         gdf = load_process_spatial_layer(
                             shp_path,
                             layer_name,
-                            simplify=True,
-                            tolerance=100,
+                            simplify=False,
                             make_valid_geom=True,
                         )
                         if gdf is not None:
                             play_layers.append({'name': layer_name, 'data': gdf})
         app_data['play_subplay_layers_list'] = play_layers
+        if play_layers:
+            cache_dirty = True
 
     if not app_data['company_layers_list']:
         print("--- Loading DISSOLVED Company Acreage ---")
         company_layers: list[dict] = []
-        if os.path.isdir(COMPANY_SHAPEFILES_DIR):
+        if COMPANY_SHAPEFILES_DIR.is_dir():
             for filename in os.listdir(COMPANY_SHAPEFILES_DIR):
                 if filename.lower().endswith('.shp'):
-                    shp_path = os.path.join(COMPANY_SHAPEFILES_DIR, filename)
-                    layer_name = os.path.splitext(filename)[0]
+                    shp_path = COMPANY_SHAPEFILES_DIR / filename
+                    layer_name = Path(filename).stem
                     gdf = load_process_spatial_layer(
                         shp_path,
                         layer_name,
@@ -931,24 +1605,70 @@ def load_and_process_all_data():
                     if gdf is not None:
                         company_layers.append({'name': layer_name, 'data': gdf})
         app_data['company_layers_list'] = company_layers
+        if company_layers:
+            cache_dirty = True
 
-    try:
-        cache_payload = {
-            'wells_gdf': empty_gdf,
-            'play_subplay_layers_list': app_data['play_subplay_layers_list'],
-            'company_layers_list': app_data['company_layers_list'],
-        }
-        with open(PROCESSED_DATA_FILE, 'wb') as f:
-            pickle.dump(cache_payload, f)
-        print(f"Cached shapefile layers to: {PROCESSED_DATA_FILE}")
-    except Exception as e:
-        print(f"Warning: Unable to cache shapefile layers ({e})")
+    if load_wells_from_db:
+        print("Fetching well master data from Oracle for cache...")
+        try:
+            wells_from_db = fetch_wells_from_db(
+                operator_codes=None,
+                formation_ids=None,
+                fields=None,
+                provinces=None,
+                date_range=None,
+            )
+        except Exception as exc:
+            print(f"WARNING: Failed to fetch wells from Oracle ({exc}).")
+            wells_from_db = empty_gdf
+        if wells_from_db is None or wells_from_db.empty:
+            wells_from_db = empty_gdf
+        else:
+            wells_from_db = ensure_operator_and_formation_columns(wells_from_db)
+            wells_from_db.attrs['truncated'] = wells_from_db.attrs.get('truncated', False)
+        app_data['wells_gdf'] = wells_from_db
+        cache_dirty = True
+
+    if app_data['wells_gdf'] is None or app_data['wells_gdf'].empty:
+        app_data['wells_gdf'] = empty_gdf
+
+    if cache_dirty:
+        _persist_app_data_cache(app_data)
 
     return app_data
 
 # --- Load data into global variables for the app ---
 APP_DATA = load_and_process_all_data()
-wells_gdf_global = ensure_operator_and_formation_columns(APP_DATA['wells_gdf'])
+
+wells_gdf_global = ensure_operator_and_formation_columns(
+    APP_DATA.get('wells_gdf', _empty_well_geodf())
+)
+if wells_gdf_global is None or wells_gdf_global.empty:
+    wells_gdf_global = _empty_well_geodf()
+    try:
+        initial_wells = fetch_wells_from_db(
+            operator_codes=None,
+            formation_ids=None,
+            fields=None,
+            provinces=None,
+            date_range=None,
+        )
+        if initial_wells is not None and not initial_wells.empty:
+            wells_gdf_global = ensure_operator_and_formation_columns(initial_wells)
+            wells_gdf_global.attrs["truncated"] = initial_wells.attrs.get("truncated", False)
+            APP_DATA['wells_gdf'] = wells_gdf_global
+            _persist_app_data_cache(APP_DATA)
+            initial_well_fetch_error = None
+        else:
+            wells_gdf_global = _empty_well_geodf()
+    except Exception as exc:
+        initial_well_fetch_error = str(exc)
+        print(f"Initial well fetch failed: {exc}")
+else:
+    wells_gdf_global.attrs["truncated"] = wells_gdf_global.attrs.get("truncated", False)
+    initial_well_fetch_error = None
+
+
 play_subplay_layers_list_global = APP_DATA['play_subplay_layers_list']
 company_layers_list_global = APP_DATA['company_layers_list']
 
@@ -966,6 +1686,8 @@ if wells_gdf_global is not None and not wells_gdf_global.empty:
             print(f"  '{col}' column IS present. Sample: {wells_gdf_global[col].dropna().head(3).to_list()}")
         else:
             print(f"  '{col}' column IS NOT present.")
+elif initial_well_load_in_progress():
+    print("  wells_gdf_global empty; background initial well fetch in progress.")
 else:
     print("  wells_gdf_global is empty before server starts (wells load on demand).")
 
@@ -1030,40 +1752,67 @@ def _assign_operator_colors(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return df, color_lookup
 
 
+def _continuous_color_scale(value: float, vmin: float, vmax: float) -> list[int]:
+    if pd.isna(value):
+        return [150, 150, 150, 120]
+
+    vmin = float(vmin)
+    vmax = float(vmax)
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+
+    v = max(vmin, min(vmax, float(value)))
+    t = (v - vmin) / (vmax - vmin)
+    r = int(30 + t * (200 - 30))
+    g = int(70 + t * (40 - 70))
+    b = int(200 + t * (30 - 200))
+    return [r, g, b, 180]
+
+
+def build_gor_pydeck_layer(gor_pts: pd.DataFrame, vmin: float = 200, vmax: float = 6000):
+    if gor_pts is None or gor_pts.empty:
+        return None
+
+    pts = gor_pts.copy()
+    pts['color_rgba'] = pts['GOR_for_map'].apply(lambda x: _continuous_color_scale(x, vmin, vmax))
+    color_df = pd.DataFrame(pts['color_rgba'].to_list(), columns=['cr', 'cg', 'cb', 'ca'], index=pts.index)
+    pts = pd.concat([pts, color_df], axis=1)
+
+    return pdk.Layer(
+        "ScatterplotLayer",
+        data=pts,
+        get_position="[SurfaceLongitude, SurfaceLatitude]",
+        get_radius=350,
+        get_fill_color="[cr, cg, cb, ca]",
+        pickable=True,
+        auto_highlight=True,
+    )
+
+
 def build_pydeck_map(
     filtered_df: gpd.GeoDataFrame,
     selected_play_layers: list[str],
     selected_company_layers: list[str],
-) -> tuple[pdk.Deck | None, list[tuple[str, str]]]:
+    *,
+    include_well_layer: bool = True,
+) -> tuple[pdk.Deck | None, dict[str, list[tuple[str, str]]]]:
     layers: list[pdk.Layer] = []
-    legend_entries: list[tuple[str, str]] = []
+    legend_entries: dict[str, list[tuple[str, str]]] = {
+        "Operators": [],
+        "Play/Subplay Boundaries": [],
+        "Company Acreage": [],
+    }
 
     view_state = pdk.ViewState(latitude=55.0, longitude=-106.0, zoom=3.5, pitch=0)
+    tooltip_html = None
+    color_lookup: dict[str, str] = {}
+    operator_counts: pd.Series | None = None
+    map_df = pd.DataFrame()
 
     if filtered_df is not None and not filtered_df.empty:
         map_df = filtered_df.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude']).copy()
         if not map_df.empty:
             map_df, color_lookup = _assign_operator_colors(map_df)
-            if 'FirstProdDate' in map_df.columns:
-                map_df['FirstProdDate'] = map_df['FirstProdDate'].dt.strftime('%Y-%m-%d')
-            tooltip_html = (
-                "<b>Well:</b> {WellName}<br/>"
-                "<b>Operator:</b> {OperatorName}<br/>"
-                "<b>Field:</b> {FieldName}<br/>"
-                "<b>Status:</b> {CurrentStatus}<br/>"
-                "<b>First Prod:</b> {FirstProdDate}"
-            )
-            layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=map_df,
-                    get_position="[SurfaceLongitude, SurfaceLatitude]",
-                    get_radius=350,
-                    get_fill_color="[color_r, color_g, color_b, color_a]",
-                    pickable=True,
-                    auto_highlight=True,
-                )
-            )
             if not map_df[['SurfaceLatitude', 'SurfaceLongitude']].isna().all().all():
                 view_state = pdk.ViewState(
                     latitude=float(map_df['SurfaceLatitude'].mean()),
@@ -1071,10 +1820,35 @@ def build_pydeck_map(
                     zoom=4,
                     pitch=0,
                 )
-        else:
-            tooltip_html = None
-    else:
-        tooltip_html = None
+
+            if include_well_layer:
+                if 'FirstProdDate' in map_df.columns:
+                    map_df['FirstProdDate'] = map_df['FirstProdDate'].dt.strftime('%Y-%m-%d')
+                tooltip_html = (
+                    "<b>Well:</b> {WellName}<br/>"
+                    "<b>Operator:</b> {OperatorName}<br/>"
+                    "<b>Field:</b> {FieldName}<br/>"
+                    "<b>Status:</b> {CurrentStatus}<br/>"
+                    "<b>First Prod:</b> {FirstProdDate}"
+                )
+                layers.append(
+                    pdk.Layer(
+                        "ScatterplotLayer",
+                        data=map_df,
+                        get_position="[SurfaceLongitude, SurfaceLatitude]",
+                        get_radius=350,
+                        get_fill_color="[color_r, color_g, color_b, color_a]",
+                        pickable=True,
+                        auto_highlight=True,
+                    )
+                )
+                if 'OperatorName' in map_df.columns:
+                    operator_counts = (
+                        map_df['OperatorName']
+                        .fillna('Unknown')
+                        .value_counts()
+                        .sort_values(ascending=False)
+                    )
 
     poly_color_cycle = cycle(CUSTOM_PALETTE)
     for layer_info in play_subplay_layers_list_global:
@@ -1097,7 +1871,9 @@ def build_pydeck_map(
                         pickable=False,
                     )
                 )
-                legend_entries.append((f"Play/Subplay: {layer_info['name']}", hex_color))
+                legend_entries["Play/Subplay Boundaries"].append(
+                    (f"{layer_info['name']}", hex_color)
+                )
 
     company_color_cycle = cycle(reversed(CUSTOM_PALETTE))
     for layer_info in company_layers_list_global:
@@ -1120,9 +1896,22 @@ def build_pydeck_map(
                         pickable=False,
                     )
                 )
-                legend_entries.append((f"Company Acreage: {layer_info['name']}", hex_color))
+                legend_entries["Company Acreage"].append(
+                    (f"{layer_info['name']}", hex_color)
+                )
 
-    if not layers:
+    if include_well_layer and operator_counts is not None and not operator_counts.empty:
+        for operator, count in operator_counts.head(MAX_OPERATOR_LEGEND_ENTRIES).items():
+            hex_color = color_lookup.get(operator, "#666666")
+            legend_entries["Operators"].append((f"{operator} ({count})", hex_color))
+
+        if len(operator_counts) > MAX_OPERATOR_LEGEND_ENTRIES:
+            extra = len(operator_counts) - MAX_OPERATOR_LEGEND_ENTRIES
+            legend_entries["Operators"].append((f"+{extra} more", "#b3b3b3"))
+
+    legend_entries = {key: value for key, value in legend_entries.items() if value}
+
+    if not layers and (map_df is None or map_df.empty) and not legend_entries:
         return None, legend_entries
 
     deck = pdk.Deck(
@@ -1133,6 +1922,62 @@ def build_pydeck_map(
         tooltip={"html": tooltip_html} if tooltip_html else None,
     )
     return deck, legend_entries
+
+
+def _render_map_legends(legend_sections: dict[str, list[tuple[str, str]]]):
+    if not legend_sections:
+        return
+
+    st.markdown("### Map Legend")
+    for section, entries in legend_sections.items():
+        if not entries:
+            continue
+        st.markdown(f"**{section}**")
+        legend_cols = st.columns(min(3, len(entries)))
+        for idx, (label, color) in enumerate(entries):
+            col = legend_cols[idx % len(legend_cols)]
+            col.markdown(
+                "<div style='display:flex; align-items:center; gap:8px;'>"
+                f"<span style='display:inline-block; width:14px; height:14px; background:{color}; border:1px solid #333;'></span>"
+                f"{html.escape(label)}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def _rgba_to_css(rgba: list[int]) -> str:
+    r, g, b, a = rgba
+    alpha = max(0, min(255, a)) / 255
+    return f"rgba({r}, {g}, {b}, {alpha:.2f})"
+
+
+def render_gor_color_legend(vmin: float, vmax: float):
+    if vmin is None or vmax is None:
+        return
+    vmin = float(vmin)
+    vmax = float(vmax)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return
+
+    stops = np.linspace(0.0, 1.0, 6)
+    colors = [
+        _rgba_to_css(_continuous_color_scale(vmin + (vmax - vmin) * t, vmin, vmax))
+        for t in stops
+    ]
+    gradient = ", ".join(f"{color} {int(t * 100)}%" for color, t in zip(colors, stops))
+    mid_value = vmin + (vmax - vmin) / 2
+
+    st.markdown(
+        "<div style='margin-top:0.75rem;'>"
+        "<div style='font-weight:600;'>GOR Colour Scale (mcf/bbl)</div>"
+        f"<div style='height:14px; border-radius:4px; margin:6px 0; background:linear-gradient(90deg, {gradient});'></div>"
+        "<div style='display:flex; justify-content:space-between; font-size:0.8rem;'>"
+        f"<span>{vmin:,.0f}</span>"
+        f"<span>{mid_value:,.0f}</span>"
+        f"<span>{vmax:,.0f}</span>"
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def fetch_single_well_production(gsl_uwi_std: str) -> pd.DataFrame:
@@ -1510,6 +2355,179 @@ def compute_filtered_group_metrics(
     }
 
 
+def _ensure_first_prod_dates_for(filtered_wells: pd.DataFrame) -> pd.DataFrame:
+    df = filtered_wells.copy()
+    if 'FirstProdDate' in df.columns and df['FirstProdDate'].notna().any():
+        return df
+
+    ids = df.get('GSL_UWI_Std', pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+    if not ids:
+        return df
+
+    if engine is None:
+        connect_to_db()
+    if engine is None:
+        return df
+
+    sql = text(
+        """
+        SELECT GSL_UWI, FIRST_PROD_DATE
+        FROM PDEN_FIRST_SUM
+        WHERE GSL_UWI IN :uwis
+        """
+    ).bindparams(bindparam("uwis", expanding=True))
+
+    fps = read_sql_resilient(sql, params={"uwis": ids}) or pd.DataFrame()
+    if fps.empty:
+        return df
+
+    fps = clean_df_colnames(fps, "PDEN_FIRST_SUM")
+    fps['GSL_UWI_Std'] = standardize_uwi(fps.get('GSL_UWI'))
+    fps['FirstProdDate'] = pd.to_datetime(fps.get('FIRST_PROD_DATE'), errors='coerce')
+    return df.merge(fps[['GSL_UWI_Std', 'FirstProdDate']], on='GSL_UWI_Std', how='left')
+
+
+def fetch_gor_long_for_wells(filtered_wells: gpd.GeoDataFrame) -> pd.DataFrame:
+    if filtered_wells is None or filtered_wells.empty:
+        raise ValueError("No wells selected for GOR computation.")
+
+    wells = _ensure_first_prod_dates_for(filtered_wells.copy())
+    id_cols = [
+        'GSL_UWI_Std',
+        'FieldName',
+        'Formation',
+        'OperatorName',
+        'ProvinceState',
+        'SurfaceLatitude',
+        'SurfaceLongitude',
+        'FirstProdDate',
+        'WellName',
+    ]
+    for col in id_cols:
+        if col not in wells.columns:
+            wells[col] = np.nan
+
+    wells['FirstProdDate'] = pd.to_datetime(wells['FirstProdDate'], errors='coerce')
+    target = wells['GSL_UWI_Std'].dropna().astype(str).unique().tolist()
+    if not target:
+        raise ValueError("No valid well identifiers.")
+
+    if engine is None:
+        connect_to_db()
+    if engine is None:
+        raise RuntimeError("Database connection not available.")
+
+    parts: list[pd.DataFrame] = []
+    for i in range(0, len(target), 300):
+        batch = target[i:i + 300]
+        sql = text(
+            """
+            SELECT GSL_UWI, YEAR, PRODUCT_TYPE,
+                   JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME,
+                   MAY_VOLUME, JUN_VOLUME, JUL_VOLUME, AUG_VOLUME,
+                   SEP_VOLUME, OCT_VOLUME, NOV_VOLUME, DEC_VOLUME
+            FROM PDEN_VOL_BY_MONTH
+            WHERE GSL_UWI IN :uwis
+              AND ACTIVITY_TYPE = 'PRODUCTION'
+              AND PRODUCT_TYPE IN ('OIL','CND','GAS')
+            """
+        ).bindparams(bindparam("uwis", expanding=True))
+        df = read_sql_resilient(sql, params={"uwis": batch})
+        if df is not None and not df.empty:
+            parts.append(df)
+
+    if not parts:
+        raise ValueError("No monthly production rows.")
+
+    df = clean_df_colnames(pd.concat(parts, ignore_index=True), "GOR monthly")
+    df['GSL_UWI_Std'] = standardize_uwi(df.get('GSL_UWI'))
+
+    month_names = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+    mcols = [f"{m}_VOLUME" for m in month_names]
+    long = pd.melt(
+        df,
+        id_vars=['GSL_UWI_Std', 'YEAR', 'PRODUCT_TYPE'],
+        value_vars=mcols,
+        var_name='MONTH_COL',
+        value_name='VOLUME',
+    )
+    long['VOLUME'] = pd.to_numeric(long['VOLUME'], errors='coerce').fillna(0.0)
+    month_map = {name: idx for idx, name in enumerate(month_names, start=1)}
+    long['MONTH_NUM'] = long['MONTH_COL'].str[:3].map(month_map)
+    long['PROD_DATE'] = pd.to_datetime(
+        long['YEAR'].astype(int).astype(str) + '-' + long['MONTH_NUM'].astype(int).astype(str) + '-01'
+    )
+
+    long['OilBBL'] = np.where(long['PRODUCT_TYPE'].isin(['OIL', 'CND']), long['VOLUME'] * M3_TO_BBL, 0.0)
+    long['GasMCF'] = np.where(long['PRODUCT_TYPE'].eq('GAS'), long['VOLUME'] * E3M3_TO_MCF, 0.0)
+
+    wm = long.groupby(['GSL_UWI_Std', 'PROD_DATE'], as_index=False).agg(
+        OilBBL=('OilBBL', 'sum'),
+        GasMCF=('GasMCF', 'sum'),
+    )
+
+    attrs = wells[id_cols].drop_duplicates('GSL_UWI_Std')
+    out = wm.merge(attrs, on='GSL_UWI_Std', how='left')
+    out = out[out['FirstProdDate'].notna()].copy()
+
+    mop = ((out['PROD_DATE'] - out['FirstProdDate']).dt.days / AVG_DAYS_PER_MONTH)
+    out['MonthOnProd'] = np.floor(mop + 0.5)
+    out = out[out['MonthOnProd'].notna()]
+    out['MonthOnProd'] = out['MonthOnProd'].astype(int) + 1
+    out = out[(out['MonthOnProd'] >= 1) & (out['MonthOnProd'] <= MAX_MOP_FOR_GOR)]
+
+    out['GOR_mcf_per_bbl'] = np.where(out['OilBBL'] > 0, out['GasMCF'] / out['OilBBL'], np.nan)
+    out.loc[out['GOR_mcf_per_bbl'] > GOR_CLIP_MAX, 'GOR_mcf_per_bbl'] = np.nan
+    return out
+
+
+def aggregate_gor_trend(gor_long: pd.DataFrame, group_col: str, min_wells: int = MIN_WELLS_PER_POINT) -> pd.DataFrame:
+    if gor_long is None or gor_long.empty:
+        return pd.DataFrame()
+
+    wells_per = gor_long.groupby([group_col, 'MonthOnProd'])['GSL_UWI_Std'].nunique().reset_index(name='WellCount')
+    avg = gor_long.groupby([group_col, 'MonthOnProd'], as_index=False).agg(AvgGOR=('GOR_mcf_per_bbl', 'mean'))
+    out = avg.merge(wells_per, on=[group_col, 'MonthOnProd'], how='left')
+    out = out[out['WellCount'] >= max(1, int(min_wells))]
+    return out.sort_values([group_col, 'MonthOnProd'])
+
+
+def latest_rolling_gor_per_well(gor_long: pd.DataFrame, months: int = GOR_MAP_WINDOW_MONTHS) -> pd.DataFrame:
+    if gor_long is None or gor_long.empty:
+        return pd.DataFrame()
+
+    last = gor_long.groupby('GSL_UWI_Std')['PROD_DATE'].max().reset_index(name='LastProdDate')
+    df = gor_long.merge(last, on='GSL_UWI_Std', how='left')
+    df = df[df['PROD_DATE'] >= (df['LastProdDate'] - pd.DateOffset(months=int(months)))]
+
+    rolled = df.groupby('GSL_UWI_Std', as_index=False).agg(
+        GOR_for_map=('GOR_mcf_per_bbl', 'mean'),
+        SurfaceLatitude=('SurfaceLatitude', 'first'),
+        SurfaceLongitude=('SurfaceLongitude', 'first'),
+        FieldName=('FieldName', 'first'),
+        Formation=('Formation', 'first'),
+        OperatorName=('OperatorName', 'first'),
+        ProvinceState=('ProvinceState', 'first'),
+        WellName=('WellName', 'first'),
+    )
+    rolled = rolled.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude'])
+    return rolled.dropna(subset=['GOR_for_map'])
+
+
+def field_level_gor(gor_long: pd.DataFrame) -> pd.DataFrame:
+    if gor_long is None or gor_long.empty:
+        return pd.DataFrame()
+
+    f = gor_long.dropna(subset=['FieldName']).copy()
+    if f.empty:
+        return pd.DataFrame()
+
+    return f.groupby(['FieldName', 'PROD_DATE'], as_index=False).agg(
+        FieldAvgGOR=('GOR_mcf_per_bbl', 'mean'),
+        Wells=('GSL_UWI_Std', 'nunique'),
+    )
+
+
 def make_filtered_group_plots(metrics: dict, breakout_label: str) -> tuple[go.Figure, go.Figure, go.Figure]:
     empty_fig = go.Figure().update_layout(title="No data available.")
     if not metrics:
@@ -1580,6 +2598,32 @@ def make_filtered_group_plots(metrics: dict, breakout_label: str) -> tuple[go.Fi
         cal_fig = empty_fig
 
     return norm_fig, cum_fig, cal_fig
+
+
+def make_gor_trend_plot(gor_trend_df: pd.DataFrame, group_col: str) -> go.Figure:
+    fig = go.Figure()
+    if gor_trend_df is None or gor_trend_df.empty:
+        fig.update_layout(title="No GOR data for current selection.")
+        return fig
+
+    for key, group_df in gor_trend_df.groupby(group_col):
+        fig.add_trace(
+            go.Scatter(
+                x=group_df['MonthOnProd'],
+                y=group_df['AvgGOR'],
+                mode='lines',
+                name=str(key),
+                hovertemplate="MoP %{x}<br>GOR %{y:.0f} mcf/bbl<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=f"Average GOR (mcf/bbl) vs Month on Production by {group_col}",
+        xaxis_title="Month on Production",
+        yaxis_title="Average GOR (mcf/bbl)",
+        hovermode="x unified",
+    )
+    return fig
 
 
 def prepare_filtered_group_table(metrics: dict, breakout_label: str) -> pd.DataFrame:
@@ -2016,6 +3060,8 @@ def _ensure_session_defaults():
         st.session_state.type_curve_error = None
     if 'operator_group_df' not in st.session_state:
         st.session_state.operator_group_df = None
+    if 'seeded_with_initial_wells' not in st.session_state:
+        st.session_state.seeded_with_initial_wells = False
 
 
 def _build_well_selector_options(df: pd.DataFrame) -> dict[str, str]:
@@ -2038,9 +3084,23 @@ def _build_well_selector_options(df: pd.DataFrame) -> dict[str, str]:
 def main() -> None:
     st.set_page_config(page_title=STREAMLIT_PAGE_TITLE, layout="wide")
     st.title("Interactive Well and Acreage Map Application")
-    st.markdown("This Streamlit interface mirrors the legacy Shiny workflows using Python.")
 
     _ensure_session_defaults()
+    _drain_initial_well_future()
+
+    if (
+        not st.session_state.seeded_with_initial_wells
+        and wells_gdf_global is not None
+        and not wells_gdf_global.empty
+    ):
+        st.session_state.filtered_wells = wells_gdf_global
+        st.session_state.seeded_with_initial_wells = True
+        st.experimental_rerun()
+
+    if initial_well_fetch_error and not st.session_state.seeded_with_initial_wells:
+        st.warning(
+            "Initial well load failed; adjust filters and press Apply to retry the database query."
+        )
 
     sidebar = st.sidebar
     sidebar.header("Well Selection Criteria")
@@ -2134,33 +3194,38 @@ def main() -> None:
     sidebar.metric("Wells Displayed", f"{len(filtered_wells):,}")
     sidebar.metric("Confidential Wells", f"{confidential_count:,}")
 
-    deck, legend_entries = build_pydeck_map(
+    deck, legend_sections = build_pydeck_map(
         filtered_wells,
         st.session_state.play_layer_selection,
         st.session_state.company_layer_selection,
     )
 
-    tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator = st.tabs([
+    initial_loading = initial_well_load_in_progress()
+
+    tab_map, tab_prod, tab_filtered, tab_type_curve, tab_operator, tab_gor, tab_gas = st.tabs([
         "Well Map",
         "Production Analysis",
         "Filtered Group Cumulative",
         "Type Curve Analysis",
         "Operator Group",
+        "GOR",
+        "Gas Plants",
     ])
 
     with tab_map:
-        if deck is not None:
+        if (
+            initial_loading
+            and (filtered_wells is None or filtered_wells.empty)
+            and not st.session_state.seeded_with_initial_wells
+        ):
+            st.info("Loading initial well dataset from Oracle...")
+        elif deck is not None:
             st.pydeck_chart(deck)
         else:
             st.info("Apply filters to render the map.")
-        if legend_entries:
-            st.markdown("### Map Legend")
-            legend_cols = st.columns(min(3, len(legend_entries)))
-            for idx, (label, color) in enumerate(legend_entries):
-                col = legend_cols[idx % len(legend_cols)]
-                col.markdown(f"<div style='display:flex; align-items:center; gap:8px;'>"
-                             f"<span style='display:inline-block; width:14px; height:14px; background:{color}; border:1px solid #333;'></span>"
-                             f"{label}</div>", unsafe_allow_html=True)
+        _render_map_legends(legend_sections)
+        if initial_well_fetch_error and not st.session_state.seeded_with_initial_wells:
+            st.error("Initial well fetch failed. Use the filters and Apply Filters to request wells.")
 
     with tab_prod:
         st.subheader("Single Well Analysis")
@@ -2355,6 +3420,169 @@ def main() -> None:
                 file_name="operator_group_summary.csv",
                 mime="text/csv",
             )
+
+    with tab_gor:
+        st.subheader("GOR Analysis (mcf/bbl)")
+
+        if filtered_wells is None or filtered_wells.empty:
+            st.info("Apply filters first to select wells.")
+        else:
+            group_choices = {
+                "Field": "FieldName",
+                "Formation": "Formation",
+                "Operator": "OperatorName",
+                "Province/State": "ProvinceState",
+            }
+            group_label = st.selectbox("Group curves by", list(group_choices.keys()), index=0)
+            mop_max = st.slider("Max Month on Production", 12, 120, MAX_MOP_FOR_GOR, step=6)
+            min_wells = st.slider("Min wells per MoP point", 1, 30, MIN_WELLS_PER_POINT)
+
+            try:
+                gor_long = fetch_gor_long_for_wells(filtered_wells)
+            except ValueError as exc:
+                st.warning(str(exc))
+                gor_long = pd.DataFrame()
+            except RuntimeError as exc:
+                st.error(str(exc))
+                gor_long = pd.DataFrame()
+            except Exception as exc:
+                st.error(f"Failed to compute GOR data: {exc}")
+                gor_long = pd.DataFrame()
+
+            if gor_long.empty:
+                st.info("No GOR data available for the current selection.")
+            else:
+                gor_long = gor_long[gor_long['MonthOnProd'] <= mop_max].copy()
+                group_col = group_choices[group_label]
+                if group_col in gor_long.columns:
+                    gor_long[group_col] = gor_long[group_col].fillna('Unknown')
+
+                trend = aggregate_gor_trend(gor_long, group_col, min_wells=int(min_wells))
+                _render_plotly_chart(make_gor_trend_plot(trend, group_col))
+
+                st.markdown("---")
+                st.subheader("Map: Well-level GOR (rolling average)")
+                roll_mo = st.slider("Rolling window (months)", 3, 12, GOR_MAP_WINDOW_MONTHS)
+                vmin = st.number_input("Color scale min (mcf/bbl)", value=200, step=50)
+                vmax = st.number_input("Color scale max (mcf/bbl)", value=6000, step=100)
+
+                gor_pts = latest_rolling_gor_per_well(gor_long, months=int(roll_mo))
+                if gor_pts.empty:
+                    st.info("No GOR points to map.")
+                else:
+                    base_deck, base_legends = build_pydeck_map(
+                        filtered_wells,
+                        st.session_state.play_layer_selection,
+                        st.session_state.company_layer_selection,
+                        include_well_layer=False,
+                    )
+                    gor_layer = build_gor_pydeck_layer(gor_pts, vmin=float(vmin), vmax=float(vmax))
+                    if base_deck is not None and gor_layer is not None:
+                        base_deck.layers = list(base_deck.layers) + [gor_layer]
+                        base_deck.tooltip = {
+                            "html": (
+                                "<b>Well:</b> {WellName}<br/>"
+                                "<b>Field:</b> {FieldName}<br/>"
+                                "<b>Formation:</b> {Formation}<br/>"
+                                "<b>GOR:</b> {GOR_for_map} mcf/bbl"
+                            )
+                        }
+                        st.pydeck_chart(base_deck)
+                        st.caption("Point color = rolling-average GOR (mcf/bbl).")
+                        if base_legends:
+                            _render_map_legends(base_legends)
+                        render_gor_color_legend(float(vmin), float(vmax))
+                    else:
+                        st.info("Unable to render GOR map with current selection.")
+
+                with st.expander("Field-level GOR time series"):
+                    fld = field_level_gor(gor_long)
+                    if fld.empty:
+                        st.info("No field names in selection.")
+                    else:
+                        fld2 = fld.sort_values(['FieldName', 'PROD_DATE']).copy()
+                        fld2['PROD_DATE'] = fld2['PROD_DATE'].dt.strftime('%Y-%m')
+                        fld_display = fld2.round({'FieldAvgGOR': 2})
+                        _render_dataframe(fld_display)
+                        st.download_button(
+                            "Download CSV",
+                            fld2.to_csv(index=False),
+                            "field_gor_timeseries.csv",
+                            "text/csv",
+                        )
+
+    with tab_gas:
+        st.subheader("Gas Plant Utilization")
+        st.caption("Size = licensed inlet capacity (10³ m³/d), colour = operator, shape = facility type.")
+
+        st13_src, st50_src = load_gas_plant_sources()
+        if (st13_src is None or st13_src.empty) and (st50_src is None or st50_src.empty):
+            st.info(
+                "Gas plant datasets not available. Place ST13 and ST50 CSV files in the data/ directory to enable this tab."
+            )
+        else:
+            month_choices = get_gas_plant_month_choices()
+            if not month_choices:
+                st.info("No monthly gas plant data available for mapping.")
+            else:
+                default_index = len(month_choices) - 1
+                selected_month = st.selectbox(
+                    "Month",
+                    month_choices,
+                    index=max(default_index, 0),
+                    key="gas_plants_month",
+                )
+
+                plants_month = prepare_gas_plants_for_month(selected_month)
+                if plants_month.empty:
+                    st.info(f"No gas plant records for {selected_month}.")
+                else:
+                    deck, plant_legends, capacity_range = build_gas_plant_deck(plants_month)
+                    if deck is not None:
+                        st.pydeck_chart(deck)
+                        if plant_legends:
+                            _render_map_legends(plant_legends)
+                        if capacity_range:
+                            st.markdown(
+                                f"**Capacity scale (10³ m³/d):** {capacity_range[0]:,.0f} – {capacity_range[1]:,.0f}"
+                            )
+                        st.caption(
+                            "Utilization = average daily gas throughput (10³ m³/d) divided by licensed inlet capacity."
+                        )
+                    else:
+                        st.info("Gas plant coordinates are missing for the selected month.")
+
+                    st.markdown("---")
+                    table_df = plants_month[[
+                        "facid",
+                        "FacilityName",
+                        "OperatorDisplay",
+                        "plant_type",
+                        "cap_km3_per_d",
+                        "throughput_km3_per_d",
+                        "utilization_pct",
+                    ]].copy()
+                    table_df = table_df.rename(columns={
+                        "facid": "Facility ID",
+                        "FacilityName": "Facility",
+                        "OperatorDisplay": "Operator",
+                        "plant_type": "Type",
+                        "cap_km3_per_d": "Capacity (10^3 m3/d)",
+                        "throughput_km3_per_d": "Throughput (10^3 m3/d)",
+                        "utilization_pct": "Utilization %",
+                    })
+                    for col in ["Capacity (10^3 m3/d)", "Throughput (10^3 m3/d)", "Utilization %"]:
+                        table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
+                    table_df["Capacity (10^3 m3/d)"] = table_df["Capacity (10^3 m3/d)"].round(1)
+                    table_df["Throughput (10^3 m3/d)"] = table_df["Throughput (10^3 m3/d)"].round(1)
+                    table_df["Utilization %"] = table_df["Utilization %"].round(1)
+                    _render_dataframe(table_df)
+                    st.download_button(
+                        "Download Gas Plant Table",
+                        data=table_df.to_csv(index=False),
+                        file_name=f"gas_plants_{selected_month}.csv",
+                        mime="text/csv",
+                    )
 
 
 if __name__ == "__main__":
